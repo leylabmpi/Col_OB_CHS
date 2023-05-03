@@ -1,0 +1,940 @@
+---
+title: "Analysis of KEGG modules"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. January 2020.
+
+The goal of this notebook is to perform analysis of KEGG modules from the metagenome profile of a sample of adult Colombians, focusing on modules previously shown to be linked with cardiometabolic disease and obesity.
+
+# Init
+Load packages
+```{r}
+# General
+library(conflicted)
+
+# CODA
+library(propr)
+library(zCompositions)
+
+# Analysis
+library(factoextra)
+
+# Graphs
+library(cowplot)
+library(viridis)
+library(ggdendro)
+library(ggnewscale)
+
+# Data manipulation
+library(glue)
+library(vegan)
+library(tidyverse)
+library(LeyLabRMisc)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("between", "dplyr")
+conflict_prefer("first", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+```
+
+Seed
+```{r}
+set.seed(1990)
+```
+
+
+## Load tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+#nonpareil_table_file = file.path(base_dir, "/data/intermediate_files/2019_01_combined/nonpareil/2019_01_coverage.tsv")
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+# Colombian samples retained
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+   read_tsv()
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                           "Overweight-Healthy", "Overweight-Abnormal",
+                                           "Obese-Healthy", "Obese-Abnormal")))
+```
+
+```{r}
+# Publicly available modules
+Module_shortlist = file.path(base_dir, "code/publicly_available_results/intermediate_files/Unified_modules.tsv") %>% 
+  read_tsv() %>% 
+  mutate(Definition = str_remove(Definition, "\\.$"))
+
+# # Module annotations
+# Module_Annotation = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping/map_kegg-mdl_name.txt.gz" %>% 
+#     read_tsv(col_names = c("Module", "Annotation"))
+# Module_Annotation = "/ebio/abt3_projects/columbian_gut_metagenome/tmp/pedersen_repo/formating_KEGG_modules/KEGG_modules.tab" %>%
+#   read_tsv(col_names = c("Module", "Annotation", "Orthologs")) %>% 
+#   select(-Orthologs) %>% 
+#   mutate(Annotation = str_remove(Annotation, " \\[[PATH|BR].*")) %>% 
+#   arrange(Module)
+# 
+# Module_shortlist = left_join(Module_shortlist, Module_Annotation) %>% 
+#   select(Module, Enrichment, Annotation)
+
+# KEGG modules in Colombian samples
+# RPK
+Col_module_rpk = file.path(LLMGP_dir, "kegg_modules/kegg_modules.tsv") %>% 
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+# Relative abundance
+Col_module_relabund = file.path(LLMGP_dir, "kegg_modules/kegg_modules_relabund.tsv") %>% 
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+```
+
+# Use clr-transformation on module abundance
+```{r}
+# Impute zeros in a compositionally aware manner
+Col_module_noZ = Col_module_rpk %>%
+    column_to_rownames("Sample") %>% 
+    cmultRepl(method = "SQ", output = "p-counts")
+
+Col_module_noZ %>% dfhead()
+
+# Execute propr package
+Col_module_propr = Col_module_noZ %>% 
+    select(-UNGROUPED, -UNMAPPED) %>% 
+    propr(., metric = "rho", p = 1000)
+
+# Extract clr-transformed values from propr object
+Col_module_clr = Col_module_propr@logratio %>% 
+    rownames_to_column("Sample")
+
+# Matrix of proportionality metric - rho
+Col_module_Mrho = Col_module_propr@matrix %>% 
+  as.data.frame()
+
+# Print head
+Col_module_clr %>% dfhead()
+Col_module_Mrho[1:5, 1:5]
+```
+
+# Filtering modules by abundance and prevalence
+## Summary stats
+Geometric mean and mean standard deviation from clr-transformed data
+```{r}
+# Calculate geometric mean
+Module_geom_mean = Col_module_clr %>%
+  summarise(across(is.numeric, function(x) compositions::mean.acomp(x)))
+
+# Standard deviation
+Module_msd = Col_module_clr %>% 
+  summarise(across(is.numeric, function(x) compositions::msd(x)))
+
+# Create single table
+Col_module_clr_summ = bind_rows(Module_geom_mean, Module_msd) %>% 
+    t_df %>% 
+    rownames_to_column("Module") %>% 
+    rename("g.mean" = "V1", "msd" = "V2") 
+
+Col_module_clr_summ %>% dfhead()
+
+# Add prevalence to summary stats table
+Col_module_prevalence = Col_module_rpk %>% 
+  select(-Sample) %>% 
+  decostand(., "pa") %>% 
+  summarise_all(function(x) sum(x)) %>% 
+  t_df() %>% 
+  rownames_to_column("Module")  %>%
+  rename("Prevalence" = "V1") %>% 
+  mutate(Prevalence = Prevalence/408)
+
+# Add candidate module data
+Col_module_clr_summ = left_join(Col_module_clr_summ, Col_module_prevalence,  by = "Module") %>% 
+  mutate(Module = fct_reorder(Module, g.mean)) %>% 
+  mutate(Candidate = factor(if_else(Module %in% Module_shortlist$Module == TRUE, "Yes", "No"))) %>% 
+  mutate(Prevalence_group = case_when(Prevalence < max(Prevalence) * 0.25 ~ "Low", 
+                                      between(Prevalence, max(Prevalence) * 0.25, max(Prevalence) * 0.5) ~ "Mid_low", 
+                                      between(Prevalence, max(Prevalence) * 0.5, max(Prevalence) * 0.75) ~ "Mid_high", 
+                                      TRUE ~ "High"), 
+         Prevalence_group = factor(Prevalence_group, levels = c("Low", "Mid_low", "Mid_high", "High")))
+
+Col_module_clr_summ %>% dfhead()
+```
+```{r}
+# Write full module summary table
+write_tsv(Col_module_clr_summ, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Full_Mod_Summ.tsv"))
+```
+
+
+## Explore modules
+```{r}
+# Number of candidate modules
+distinct_candidates = Module_shortlist %>% 
+  select(Module) %>% 
+  distinct()
+
+distinct_candidates %>% 
+  nrow
+
+# Number of modules in Colombian data
+Col_module_clr_summ %>% nrow
+
+# Candidate modules present in Colombian data
+Col_module_clr_summ %>% 
+  filter(Candidate == "Yes") %>% 
+  select(Module) %>% 
+  distinct() %>% 
+  nrow
+
+# Candidate modules not detected in Colombian data
+absent_candidates = anti_join(distinct_candidates, Col_module_clr_summ, by = "Module") 
+absent_candidates %>% 
+  nrow
+```
+
+```{r fig.width=5, fig.height=9}
+# Scatter plot of msd by geometric mean
+Module_Mean_SD_scatterplot = Col_module_clr_summ %>% 
+  ggplot(aes(x = g.mean, y = msd, color = Prevalence_group, pch = Candidate)) +
+  geom_point() +
+  scale_shape_manual(values=c(0, 19)) +
+  theme_light() +
+  scale_color_viridis_d(option = "viridis",alpha = 0.8) +
+  labs(x = "Mean clr(Abundance)", y = "Standard deviation", color = "Prevalence")
+
+# Scatter plot of msd by geometric mean
+Module_Mean_Prevalence_scatterplot = Col_module_clr_summ %>% 
+  mutate(Prevalence = Prevalence*100) %>% 
+  ggplot(aes(x = g.mean, y = Prevalence, color = Prevalence_group, pch = Candidate)) +
+  geom_point() +
+  scale_shape_manual(values=c(0, 19)) +
+  theme_light() +
+  scale_color_viridis_d(option = "viridis", alpha = 0.8) +
+  labs(x = "Mean clr(Abundance)", y = "Prevalence (%)", color = "Prevalence")
+
+Module_summary_scatter = ggpubr::ggarrange(Module_Mean_SD_scatterplot, Module_Mean_Prevalence_scatterplot, 
+                  common.legend = TRUE, legend="none", align = "hv", ncol = 1)
+
+Module_summary_scatter
+
+ 
+save_plot(file.path(fig_dir, "Module_summary_scatterplot.png"), Module_summary_scatter,
+          base_width = 5, base_height = 9)
+```
+
+
+```{r}
+# Mean prevalence of modules
+Col_module_clr_summ %>% 
+  summarise(mean_prevalence = mean(Prevalence))
+
+# Mean prevalence by candidate status
+Col_module_clr_summ %>% 
+  group_by(Candidate) %>% 
+  summarise(mean_prevalence = mean(Prevalence))
+```
+
+```{r}
+# Candidate modules with low prevalence
+nonPrevalent_candidates = Col_module_clr_summ %>% 
+  filter(Candidate == "Yes", Prevalence_group %in% c("Low", "Mid_low")) %>% 
+  left_join(Module_shortlist, by = "Module") %>% 
+  select(Module, Definition, Enrichment, everything())
+
+Prevalent_candidates = Col_module_clr_summ %>% 
+  filter(Candidate == "Yes", Prevalence_group %in% c("High", "Mid_high")) %>% 
+  left_join(Module_shortlist, by = "Module") %>% 
+  select(Module, Definition, Enrichment, everything())
+
+nonPrevalent_candidates %>% 
+  select(Module) %>% 
+  distinct()
+```
+
+## Filter
+Since the number of candidate modules with low prevalence is rather small, I will remove them from the analysis.
+```{r}
+Col_candidate_clr = Col_module_clr  %>% 
+  select(Sample, one_of(Prevalent_candidates$Module))
+
+Col_candidate_clr %>% dim
+
+Col_candidate_Mrho = Col_module_Mrho %>%
+  rownames_to_column("Module") %>% 
+  filter(Module %in% Prevalent_candidates$Module) %>% 
+  select(Module, one_of(Prevalent_candidates$Module)) %>% 
+  column_to_rownames("Module")
+```
+
+# Plots
+## Heatmap of all present module abundance across samples 
+Col_module_clr
+```{r fig.width=12, fig.height=8}
+# Create df of geometric mean of modules
+allMod_order_df = Col_module_clr_summ %>%
+  select(Module, g.mean) %>%
+  distinct()
+
+# Create dendrograms of sample and module similitude
+heatmap_all_module_clr = Col_module_clr %>% 
+  column_to_rownames("Sample")
+
+# Samples dendrogram from Aitchison distances (i.e. eucludean dist on clr-transformed abundance)
+clr_tree_x = dist(heatmap_all_module_clr) %>% 
+  hclust(., method = "ward.D2") %>%
+  as.dendrogram()
+
+# Module distances
+# Order dendrogram by module abundance
+clr_tree_y = heatmap_all_module_clr %>% 
+  t() %>% 
+  dist() %>% 
+  hclust(., method = "ward.D2") %>%
+  vegan:::reorder.hclust(., allMod_order_df$g.mean, agglo.FUN = "max") %>% 
+  as.dendrogram()
+```
+
+```{r fig.width=12, fig.height=8}
+row_color_df = Col_module_clr_summ %>% 
+  mutate(Prevalence_group = as.factor(Prevalence_group),
+         Prevalence_color = case_when(Prevalence_group == "Low" ~ "#450054",
+                                      Prevalence_group == "Mid_low" ~ "#30688e",
+                                      Prevalence_group == "Mid_high" ~ "#2aa463",
+                                      Prevalence_group == "High" ~ "#fde724"),
+         Candidate_color = if_else(Candidate == "Yes", "black", "grey99"))
+
+  
+Cand_clr_heatmap_A = gplots::heatmap.2(as.matrix(heatmap_all_module_clr), 
+          col = viridis(100, option = "B"),
+          Colv = clr_tree_y,
+          Rowv = clr_tree_x,
+          ColSideColors = row_color_df$Prevalence_color,
+          labRow = F,
+          labCol = F,
+          key = T, 
+          keysize = 1,
+          symbreaks = F,
+          density.info = 'none',
+          key.title = NA,
+          trace = "none",
+          key.xlab = "clr(Abundance)", 
+          xlab = "KEGG module",
+          ylab = "Sample")
+
+Cand_clr_heatmap_B = gplots::heatmap.2(as.matrix(heatmap_all_module_clr), 
+          col = viridis(100, option = "B"),
+          Colv = clr_tree_y,
+          Rowv = clr_tree_x,
+          ColSideColors = row_color_df$Candidate_color,
+          labRow = F,
+          labCol = F,
+          key = T, 
+          keysize = 1,
+          symbreaks = F,
+          density.info = 'none',
+          key.title = NA,
+          trace = "none",
+          key.xlab = "clr(Abundance)", 
+          xlab = "KEGG module",
+          ylab = "Sample")
+
+
+# Plot heatmap
+png(file.path(fig_dir, "Module_clr_heatmap_A.png"), units = "in", width = 10, height = 7, res = 300); eval(Cand_clr_heatmap_A$call)
+png(file.path(fig_dir, "Module_clr_heatmap_B.png"), units = "in", width = 10, height = 7, res = 300); eval(Cand_clr_heatmap_B$call)
+```
+
+## Include association to heatmap info
+```{r fig.width=12, fig.height=8}
+# Load module significance table
+sig_tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+
+ob_uniq_mod = file.path(sig_tab_dir, "ob_uniq_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  filter(value == "BMI") %>% 
+  select(Module = feature) %>% 
+  mutate(Association_group = "OB unique")
+chs_uniq_mod = file.path(sig_tab_dir, "chs_uniq_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  filter(value == "BMI") %>% 
+  select(Module = feature) %>% 
+  mutate(Association_group = "CHS unique")
+
+core_mod = file.path(sig_tab_dir, "core_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  filter(value == "BMI") %>% 
+  select(Module = feature) %>% 
+  mutate(Association_group = "Shared")
+
+significant_modules = bind_rows(list(ob_uniq_mod, chs_uniq_mod, core_mod))
+
+# Add to Col_module_clr_summ
+Col_module_significant = Col_module_clr_summ %>% 
+  left_join(significant_modules) %>% 
+  mutate(Association_group = case_when(Candidate == "Yes" & is.na(Association_group) ~ "None",
+                                       Candidate == "No" & is.na(Association_group) ~ "Not tested", 
+                                       TRUE ~ Association_group)) %>% 
+  select(Module, Association_group)
+
+sig_row_color_df = Col_module_significant %>% 
+  mutate(Association_group = as.factor(Association_group),
+         Association_group = case_when(Association_group == "None" ~ "#cccccc",
+                                       Association_group == "Not tested" ~ "white",
+                                       Association_group == "OB unique" ~ "#3a539e",
+                                       Association_group == "CHS unique" ~ "#f5a755",
+                                       Association_group == "Shared" ~ "#93c6c3"))
+# Create heatmap
+Sig_clr_heatmap = gplots::heatmap.2(as.matrix(heatmap_all_module_clr), 
+                                    col = viridis(100, option = "B"),
+                                    Colv = clr_tree_y,
+                                    Rowv = clr_tree_x,
+                                    ColSideColors = sig_row_color_df$Association_group,
+                                    labRow = F,
+                                    labCol = F,
+                                    key = T, 
+                                    keysize = 1,
+                                    symbreaks = F,
+                                    density.info = 'none',
+                                    key.title = NA,
+                                    trace = "none",
+                                    key.xlab = "clr(Abundance)", 
+                                    xlab = "KEGG module",
+                                    ylab = "Sample")
+png(file.path(fig_dir, "Module_clr_heatmap_Significant.png"), units = "in", width = 10, height = 7, res = 300); eval(Sig_clr_heatmap$call)
+
+```
+
+
+## Heatmap of candidate module abundance across samples
+```{r fig.width=12, fig.height=8}
+# Create df of geometric mean of modules
+candidates_order_df = Prevalent_candidates %>%
+  select(Module, g.mean) %>%
+  distinct()
+
+# Create dendrograms of sample and module similitude
+heatmap_module_clr = Col_candidate_clr %>% 
+  column_to_rownames("Sample")
+
+# Samples dendrogram from Aitchison distances (i.e. eucludean dist on clr-transformed abundance)
+clr_tree_x = dist(heatmap_module_clr) %>% 
+  hclust(., method = "ward.D2") %>%
+  as.dendrogram()
+
+# Module distances
+# Order dendrogram by module abundance
+clr_tree_y = heatmap_module_clr %>% 
+  t() %>% 
+  dist() %>% 
+  hclust(., method = "ward.D2") %>%
+  vegan:::reorder.hclust(., candidates_order_df$g.mean, agglo.FUN = "max") %>% 
+  as.dendrogram()
+
+Cand_clr_heatmap = gplots::heatmap.2(as.matrix(heatmap_module_clr), 
+          col = viridis(100, option = "B"),
+          Colv = clr_tree_y,
+          Rowv = clr_tree_x,
+          #ColSideColors = row_color_df$Prevalence_color,
+          labRow = F,
+          labCol = F,
+          key = T, 
+          keysize = 1,
+          symbreaks = F,
+          density.info = 'none',
+          key.title = NA,
+          trace = "none",
+          key.xlab = "clr(Abundance)", 
+          xlab = "KEGG module",
+          ylab = "Sample")
+
+# Plot heatmap
+png(file.path(fig_dir, "Cand_clr_heatmap.png"), units = "in", width = 10, height = 7, res = 300); eval(Cand_clr_heatmap$call)
+```
+
+
+## Heatmap of module proportionality
+### Cluster modules based on rho distance
+```{r}
+# Determine number of module clusters based on hierarchical clustering using rho distance
+# Calulated using the methods used in Koren et al. (2013) DOI:10.1371/journal.pcbi.1002863
+
+# Calculate rho distance
+module_dist = as.dist(1 - abs(Col_candidate_Mrho))
+
+# Module PCoA
+rho_PCoA = cmdscale(module_dist, k = 3, eig = T)
+
+# Percentage of variance explained by each component
+v_PCos = round(rho_PCoA$eig/sum(rho_PCoA$eig), 4)* 100
+
+# Obtain % of variance of each axis
+v_PC1 = v_PCos %>% nth(1)
+v_PC2 = v_PCos %>% nth(2)
+v_PC3 = v_PCos %>% nth(3)
+
+rho_PCA_axes = rho_PCoA$points %>% 
+    as.data.frame
+
+# Perform hierarchical clustering with Ward's method
+# Order dendrogram by mean clr-transformed abundance
+module_hclust_prop = module_dist %>% 
+  hclust(., method = "ward.D2")
+
+module_tree_prop = module_hclust_prop %>%
+  vegan:::reorder.hclust(., candidates_order_df$g.mean, agglo.FUN = "max") %>% 
+  as.dendrogram()
+```
+
+### Determine support for clustering of modules
+```{r fig.width=6, fig.height=7}
+# Silhouette index
+silhouette_nbclust = fviz_nbclust(x = as.matrix(module_dist), FUN = hcut, 
+                                  method = "silhouette", k.max = 10)
+
+# plots SI ~ number of clusters
+silhouette_plot =  silhouette_nbclust$data %>% 
+ggplot(., aes(x = clusters, y = y)) + 
+  geom_segment(aes(x = clusters, xend = clusters, y = y, yend = 0)) +
+  geom_point(color = "darkgrey", size = 2) + 
+  labs(x = "Number of clusters", y = "Average silhouette index") + 
+  # geom_hline(yintercept = 0.5) +
+  theme_light()
+
+# Elbow method
+wss_nbclust = fviz_nbclust(x = as.matrix(module_dist), FUN = hcut, 
+                           method = "wss", k.max = 10)
+
+# plots within cluster SS ~ number of clusters
+wss_plot = wss_nbclust$data %>% # plots SI ~ number of clusters
+ggplot(., aes(x = clusters, y = y)) + 
+  geom_segment(aes(x = clusters, xend = clusters, y = y, yend = 0)) +
+  geom_point(color = "darkgrey", size = 2) + 
+  labs(x = "Number of clusters", y = "Within cluster Sum of Squares") + 
+  # geom_hline(yintercept = 0.5) +
+  theme_light()
+
+plot_grid(silhouette_plot, wss_plot, nrow = 2, labels = "AUTO", align = "v")
+  
+```
+
+
+```{r fig.width=17, fig.height=7}
+# While there's poor support for clustering in general
+# I will use an arbitrary number of cluster
+# To group modules to get a better sense of how they might be related
+
+cluster_viridis_cols = scales::viridis_pal()(7) %>% str_remove_all("FF$")
+cluster_viridis_cols %>% dput()
+
+module_clustering <- cutree(module_hclust_prop, k = 7) %>% 
+  as.data.frame %>% 
+  rename("Cluster" = ".") %>% 
+  rownames_to_column("Module") %>% 
+  mutate(Color = case_when(Cluster == 1 ~ "#440154", #
+                           Cluster == 2 ~ "#443A83", 
+                           Cluster == 3 ~ "#31688E", 
+                           Cluster == 4 ~ "#21908C", 
+                           Cluster == 5 ~ "#35B779", 
+                           Cluster == 6 ~ "#8FD744", 
+                           Cluster == 7 ~ "#FDE725"), 
+         Cluster = case_when(Cluster == 1 ~ "A",
+                             Cluster == 2 ~ "B",
+                             Cluster == 3 ~ "C", 
+                             Cluster == 4 ~ "D", 
+                             Cluster == 5 ~ "E", 
+                             Cluster == 6 ~ "F", 
+                             Cluster == 7 ~ "G"))
+
+```
+
+```{r fig.width=12, fig.height=6}
+# Create a df with the dendrogram data to use with ggdendro
+clr_tree_data = dendro_data(module_tree_prop)
+
+# Join dendrogram data with cluster data
+dendro_labs = module_clustering %>% 
+  left_join(label(clr_tree_data), ., by = c("label" = "Module"))
+
+ggplot(segment(clr_tree_data)) +
+  geom_segment(aes(x=x, y=y, xend=xend, yend=yend)) +
+  theme_dendro() +
+  geom_tile(data = dendro_labs, aes(y = -0.15, x = 1:nrow(dendro_labs), height = 0.15, fill = factor(Cluster))) +
+  scale_fill_viridis_d(option = "viridis") +
+  #scale_fill_viridis_d(option = "viridis", labels = c("A", "B", "C", "D", "E", "F")) +
+  labs(fill = "Cluster")
+
+
+```
+
+```{r fig.width=9, fig.height=9}
+# Heatmap of module rho distance
+# Shows association of modules with each other
+# Print heatmap
+gplots::heatmap.2(as.matrix(module_dist), 
+          col = viridis(100, option = "B"),
+          Colv = module_tree_prop,
+          Rowv = module_tree_prop, 
+          revC = FALSE, 
+          ColSideColors = as.character(module_clustering$Color),
+          #RowSideColors = as.character(module_clustering$Color),
+          labRow = FALSE,
+          labCol = FALSE,
+          key = TRUE, 
+          symbreaks = FALSE,
+          keysize = 1,
+          density.info = 'none',
+          key.title = NA,
+          key.xlab = "Proportionality distance",
+          trace = "none",
+          xlab = "Kegg Modules",
+          ylab = "Kegg Modules")
+```
+
+# Export tables
+```{r}
+# Export modules and annot for visualization outside R
+
+ret_modules_annot = Prevalent_candidates %>% 
+  left_join(., module_clustering, by = "Module") %>% 
+  select(Module, Definition, Cluster, everything()) %>%
+  group_by(Module) %>% 
+  slice(1) %>% 
+  ungroup() %>% 
+  arrange(Cluster)
+
+write_tsv(ret_modules_annot, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Candidate_Modules.tsv"))
+
+write_tsv(Col_candidate_clr, 
+          file.path(logratios_dir, "Candidate_Modules_clr.tsv"))
+
+write_tsv(Col_candidate_Mrho, 
+          file.path(logratios_dir, "Candidate_Modules_rho.tsv"))
+```
+
+# KEGG Orthogroups
+### Load annotation
+```{r}
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+# KO
+# Load table
+ko_ortho = file.path(annotation_dir, "ko_annot.tsv") %>% 
+    read_tsv()
+```
+### Load candidate orthologs
+```{r}
+# Publicly available KOs
+Ortho_shortlist = file.path(base_dir, "code/publicly_available_results/intermediate_files/Unified_KOs.tsv") %>% 
+  read_tsv() 
+Ortho_shortlist %>% dfhead()
+
+# KEGG orthologs in Colombian samples
+# RPK
+Col_ortho_rpk = file.path(LLMGP_dir, 'unnormalized/unstratified/regroup/genefamilies_uniref50_ko.tsv.gz') %>%
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+Col_ortho_relabund = file.path(LLMGP_dir, 'normalized/unstratified/regroup/annot/genefamilies_uniref50_ko.tsv.gz') %>%
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+```
+
+### Use clr-transformation on ortholog abundance
+```{r}
+# Impute zeros in a compositionally aware manner
+Col_ortho_noZ = Col_ortho_rpk %>%
+    column_to_rownames("Sample") %>% 
+    cmultRepl(method = "SQ", output = "p-counts")
+
+Col_ortho_noZ %>% dfhead()
+
+# Execute propr package
+Col_ortho_propr = Col_ortho_noZ %>% 
+    select(-UNGROUPED, -UNMAPPED) %>% 
+    propr(., metric = "rho", p = 1000)
+
+# Extract clr-transformed values from propr object
+Col_ortho_clr = Col_ortho_propr@logratio %>% 
+    rownames_to_column("Sample")
+
+# Matrix of proportionality metric - rho
+Col_ortho_Mrho = Col_ortho_propr@matrix %>% 
+  as.data.frame()
+
+# Print head
+Col_ortho_clr %>% dfhead()
+Col_ortho_Mrho[1:5, 1:5]
+```
+
+## Filtering modules by abundance and prevalence
+### Summary stats
+Geometric mean and mean standard deviation from clr-transformed data
+```{r}
+# Calculate geometric mean
+Ortho_geom_mean = Col_ortho_clr %>%
+  summarise(across(is.numeric, function(x) compositions::mean.acomp(x)))
+
+# Standard deviation
+Ortho_msd = Col_ortho_clr %>% 
+  summarise(across(is.numeric, function(x) compositions::msd(x)))
+
+# Create single table
+Col_ortho_clr_summ = bind_rows(Ortho_geom_mean, Ortho_msd) %>% 
+    t_df %>% 
+    rownames_to_column("Ortholog") %>% 
+    rename("g.mean" = "V1", "msd" = "V2") 
+
+Col_ortho_clr_summ %>% dfhead()
+
+# Add prevalence to summary stats table
+Col_ortho_prevalence = Col_ortho_rpk %>% 
+  select(-Sample) %>% 
+  decostand(., "pa") %>% 
+  summarise_all(function(x) sum(x)) %>% 
+  t_df() %>% 
+  rownames_to_column("Ortholog")  %>%
+  rename("Prevalence" = "V1") %>% 
+  mutate(Prevalence = Prevalence/408)
+
+# Add candidate module data
+Col_ortho_clr_summ = left_join(Col_ortho_clr_summ, Col_ortho_prevalence,  by = "Ortholog") %>% 
+  mutate(Ortholog = fct_reorder(Ortholog, g.mean)) %>% 
+  mutate(Candidate = factor(if_else(Ortholog %in% Ortho_shortlist$KO == TRUE, "Yes", "No"))) %>% 
+  mutate(Prevalence_group = case_when(Prevalence < max(Prevalence) * 0.25 ~ "Low", 
+                                      between(Prevalence, max(Prevalence) * 0.25, max(Prevalence) * 0.5) ~ "Mid_low", 
+                                      between(Prevalence, max(Prevalence) * 0.5, max(Prevalence) * 0.75) ~ "Mid_high", 
+                                      TRUE ~ "High"), 
+         Prevalence_group = factor(Prevalence_group, levels = c("Low", "Mid_low", "Mid_high", "High")))
+
+Col_ortho_clr_summ %>% dfhead()
+```
+
+```{r}
+# Write full module summary table
+write_tsv(Col_ortho_clr_summ, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Full_Ortho_Summ.tsv"))
+
+```
+
+
+## Explore orthologs
+```{r}
+# Number of candidate modules
+distinct_ortho_candidates = Ortho_shortlist %>% 
+  select(KO) %>% 
+  distinct()
+
+distinct_ortho_candidates %>% 
+  nrow
+
+# Number of modules in Colombian data
+Col_ortho_clr_summ %>% nrow
+
+# Candidate modules present in Colombian data
+Col_ortho_clr_summ %>% 
+  filter(Candidate == "Yes") %>% 
+  select(Ortholog) %>% 
+  distinct() %>% 
+  nrow
+
+# Candidate modules not detected in Colombian data
+absent_candidates = anti_join(distinct_ortho_candidates, Col_ortho_clr_summ, by = c("KO" = "Ortholog")) 
+absent_candidates %>% 
+  nrow
+```
+
+```{r}
+# Scatter plot of msd by geometric mean
+Col_ortho_clr_summ %>% 
+  ggplot(aes(x = g.mean, y = msd, color = Prevalence_group, pch = Candidate)) +
+  geom_point() +
+  scale_shape_manual(values=c(0, 19)) +
+  theme_light() +
+  scale_color_viridis_d(option = "viridis",alpha = 0.6) +
+  labs(x = "Geometric mean", y = "Standard deviation", color = "Prevalence")
+```
+
+```{r}
+# Mean prevalence of modules
+Col_ortho_clr_summ %>% 
+  summarise(mean_prevalence = mean(Prevalence))
+
+# Mean prevalence by candidate status
+Col_ortho_clr_summ %>% 
+  group_by(Candidate) %>% 
+  summarise(mean_prevalence = mean(Prevalence))
+```
+
+
+```{r}
+# Candidate modules with low prevalence
+nonPrevalent_orthologs = Col_ortho_clr_summ %>% 
+  filter(Candidate == "Yes", Prevalence_group %in% c("Low", "Mid_low")) %>% 
+  left_join(Ortho_shortlist, by = c("Ortholog" = "KO")) %>% 
+  select(Ortholog, Enrichment, everything())
+
+Prevalent_orthologs = Col_ortho_clr_summ %>% 
+  filter(Candidate == "Yes", Prevalence_group %in% c("High", "Mid_high")) %>% 
+  left_join(Ortho_shortlist, by = c("Ortholog" = "KO")) %>% 
+  select(Ortholog, Enrichment, everything())
+
+Prevalent_orthologs %>% 
+  select(Ortholog) %>% 
+  distinct() %>% 
+  dfhead()
+
+nonPrevalent_orthologs %>% 
+  select(Ortholog) %>% 
+  distinct() %>% 
+  dfhead()
+```
+
+## Filter
+Since the number of candidate orthologs with low prevalence is rather small, I will remove them from the analysis.
+```{r}
+Col_candidate_ortho_clr = Col_ortho_clr  %>% 
+  select(Sample, one_of(Prevalent_orthologs$Ortholog))
+
+Col_candidate_ortho_clr %>% dim
+
+Col_candidate_ortho_Mrho = Col_ortho_Mrho %>%
+  rownames_to_column("Module") %>% 
+  filter(Module %in% Prevalent_orthologs$Ortholog) %>% 
+  select(Module, one_of( Prevalent_orthologs$Ortholog)) %>% 
+  column_to_rownames("Module")
+```
+
+### Add Ortholog annotation
+```{r}
+# Export orthologs and annot for visualization outside R
+
+ret_ortho_annot = left_join(Prevalent_orthologs, ko_ortho, by = c("Ortholog" = "ko_name")) %>% 
+  select(Ortholog, ko_description, everything()) %>% 
+  rename("Description" = "ko_description") %>% 
+  group_by(Ortholog) %>% 
+  slice(1) %>% 
+  ungroup() 
+
+
+write_tsv(ret_ortho_annot, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Candidate_Orthologs.tsv"))
+
+write_tsv(Col_candidate_ortho_clr, 
+          file.path(logratios_dir, "Candidate_Orthologs_clr.tsv"))
+
+write_tsv(Col_candidate_ortho_Mrho, 
+          file.path(logratios_dir, "Candidate_Orthologs_rho.tsv"))
+```
+
+
+# ADD GOMixer annotation
+```{r}
+# Read GOMixer mapping file
+GMM_table_raw = file.path(base_dir, "data/publicly_available_results/GOMixer_GMMs/GMM_NoCommas.tsv") %>% 
+  read_tsv(col_names = c("GMM", "Annot", "KOs"))
+
+GMM_hierarchy = file.path(base_dir, "data/publicly_available_results/GOMixer_GMMs/GMM_Hierarchy.tsv") %>% 
+  read_tsv()
+
+# Separate KOs
+GMM_table = GMM_table_raw %>% 
+  as.tibble() %>% 
+  mutate(KOs = str_split(KOs, pattern = ";"))
+
+GMM_table %>% 
+  dfhead()
+```
+
+```{r}
+# List of KEGG ortholog IDs
+Ortholog_ID = ret_ortho_annot$Ortholog
+
+# Map KOs to GMMs
+Ortho_GMM = map(Ortholog_ID, function(x) {
+  found = suppressWarnings(stringi::stri_detect_fixed(GMM_table$KOs, x))
+  found = GMM_table$GMM[found]
+  found
+  })
+
+# Replace non-matches with NAs
+Ortho_GMM = map(Ortho_GMM, function(x){
+  if(is_empty(x)){
+    return(NA_character_)
+  } else {
+    return(x)
+  }
+})
+
+# Convert from list to data frame
+Ortho_GMM_df_raw = map2_df(Ortholog_ID, Ortho_GMM, function(KO_ID, GMM_ID){
+  data.frame(Ortholog = rep(KO_ID, length(GMM_ID)), GMM = GMM_ID)
+})
+
+# Final table of orthologs with GMM annotations
+Ortho_GMM_df = Ortho_GMM_df_raw %>% 
+  left_join(GMM_table, by = "GMM") %>% 
+  select(-KOs) %>% 
+  left_join(ret_ortho_annot) %>% 
+  select(Ortholog, GMM, Annot, Description) %>% 
+  left_join(GMM_hierarchy, by = c("GMM" = "Module", "Annot" = "Name"))
+
+Ortho_GMM_df
+```
+
+## Write table
+```{r}
+Ortho_GMM_df = write_tsv(Ortho_GMM_df, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Candidate_Orthologs_GMM.tsv"))
+```
+
+

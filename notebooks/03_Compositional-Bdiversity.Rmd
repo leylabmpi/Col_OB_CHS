@@ -1,0 +1,508 @@
+---
+title: "Compositional B-diversity analyses"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. February 2021.
+
+The goal of this notebook is to fit linear models to dissentangle cardiometabolic disease and obesity associations with the functional profile of the gut metagenome of a sample of adult Colombians.
+
+
+# Init
+Load packages
+```{r}
+# Misc
+library(LeyLabRMisc)
+library(conflicted)
+
+# Graphs
+library(cowplot)
+library(UpSetR)
+
+# CODA
+library(propr)
+library(zCompositions)
+
+# Data manipulation
+library(glue)
+library(data.table)
+library(tidyverse)
+
+# Analyis
+library(vegan)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("first", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+```
+
+Set seed
+```{r}
+set.seed(1990)
+#plan(multisession, workers = 2)
+```
+## Load metadata tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+
+```{r}
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+    fread(., data.table = F)
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+```
+
+## Load KEGG modules
+```{r}
+# Publicly available modules
+Module_shortlist = file.path(base_dir, "code/publicly_available_results/intermediate_files/Unified_modules.tsv") %>% 
+  read_tsv() %>% 
+  mutate(Definition = str_remove(Definition, "\\.$"))
+
+# # Module annotations
+# Module_Annotation = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping/map_kegg-mdl_name.txt.gz" %>% 
+#     read_tsv(col_names = c("Module", "Annotation"))
+# Module_Annotation = "/ebio/abt3_projects/columbian_gut_metagenome/tmp/pedersen_repo/formating_KEGG_modules/KEGG_modules.tab" %>%
+#   read_tsv(col_names = c("Module", "Annotation", "Orthologs")) %>% 
+#   select(-Orthologs) %>% 
+#   mutate(Annotation = str_remove(Annotation, " \\[[PATH|BR].*")) %>% 
+#   arrange(Module)
+# 
+# Module_shortlist = left_join(Module_shortlist, Module_Annotation) %>% 
+#   select(Module, Enrichment, Annotation)
+
+# KEGG modules in Colombian samples
+# RPK
+Col_module_rpk = file.path(LLMGP_dir, "kegg_modules/kegg_modules.tsv") %>% 
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+# Relative abundance
+Col_module_relabund = file.path(LLMGP_dir, "kegg_modules/kegg_modules_relabund.tsv") %>% 
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+```
+
+# Use clr-transformation on module abundance
+```{r}
+# Impute zeros in a compositionally aware manner
+Col_module_noZ = Col_module_rpk %>%
+    column_to_rownames("Sample") %>% 
+    cmultRepl(method = "SQ", output = "p-counts")
+
+Col_module_noZ %>% dfhead()
+
+# Execute propr package
+Col_module_propr = Col_module_noZ %>% 
+    select(-UNGROUPED, -UNMAPPED) %>% 
+    propr(., metric = "rho", p = 1000)
+
+# Extract clr-transformed values from propr object
+Col_module_clr = Col_module_propr@logratio %>% 
+    rownames_to_column("Sample")
+
+# Matrix of proportionality metric - rho
+Col_module_Mrho = Col_module_propr@matrix %>% 
+  as.data.frame()
+
+# Print head
+Col_module_clr %>% dfhead()
+Col_module_Mrho[1:5, 1:5]
+```
+
+## Load KEGG orthologs
+```{r}
+# Publicly available KOs
+Ortho_shortlist = file.path(base_dir, "code/publicly_available_results/intermediate_files/Unified_KOs.tsv") %>% 
+  read_tsv() 
+Ortho_shortlist %>% dfhead()
+
+# KEGG orthologs in Colombian samples
+# RPK
+Col_ortho_rpk = file.path(LLMGP_dir, 'unnormalized/unstratified/regroup/genefamilies_uniref50_ko.tsv.gz') %>%
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+Col_ortho_relabund = file.path(LLMGP_dir, 'normalized/unstratified/regroup/annot/genefamilies_uniref50_ko.tsv.gz') %>%
+  read_tsv() %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+```
+
+Use clr-transformation on ortholog abundance
+```{r}
+# Impute zeros in a compositionally aware manner
+Col_ortho_noZ = Col_ortho_rpk %>%
+    column_to_rownames("Sample") %>% 
+    cmultRepl(method = "SQ", output = "p-counts")
+
+Col_ortho_noZ %>% dfhead()
+
+# Execute propr package
+Col_ortho_propr = Col_ortho_noZ %>% 
+    select(-UNGROUPED, -UNMAPPED) %>% 
+    propr(., metric = "rho", p = 1000)
+
+# Extract clr-transformed values from propr object
+Col_ortho_clr = Col_ortho_propr@logratio %>% 
+    rownames_to_column("Sample")
+
+
+# Print head
+Col_ortho_clr %>% dfhead()
+```
+
+# Calculate distances and perform PCoA
+## Modules
+```{r}
+# Perform principal component analysis
+module_distances = Col_module_clr %>% 
+  column_to_rownames("Sample") %>% 
+    dist(method = "euclidean")
+
+module_PCoA = cmdscale(module_distances, k = 3, eig = T)
+
+# Percentage of variance explained by each component
+mod_PCos = round(module_PCoA$eig/sum(module_PCoA$eig), 4)* 100
+
+# Obtain % of variance of each axis
+mod_PC1 = mod_PCos %>% nth(1)
+mod_PC2 = mod_PCos %>% nth(2)
+mod_PC3 = mod_PCos %>% nth(3)
+
+module_PCA_axes = module_PCoA$points %>% 
+    as.data.frame
+
+# Graph PCo1 and PCo2
+module_PCA_plot = module_PCA_axes %>% 
+    ggplot(aes(x = V1, y = V2)) +
+    geom_point() + 
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2))
+
+module_PCA_plot
+
+#save_plot(file.path(fig_dir, "module_PCA_plot.png"), module_PCA_plot, base_width = 8, base_height = 4)
+```
+
+### Betadisper and PERMANOVA
+Create a funciton to test beta dispersion and execute permanova together
+```{r}
+Bdiv_test = function(dist_matrix, explanatory_var, perms = 9999, n_cores = 1){
+  # Betadisper
+  disp_test  = betadisper(dist_matrix, explanatory_var)
+  disp_res = permutest(disp_test, pairwise=TRUE, permutations = perms)
+  
+  # PERMANOVA
+ permanova = adonis(dist_matrix ~ explanatory_var, permutations = perms, parallel = n_cores)
+  
+  # Result
+  res_list = list(betadisp = disp_res$tab, permanova = as.data.frame(permanova$aov.tab))
+  res_list
+}
+```
+
+### Check data unbalance
+```{r}
+# BMI
+Col_metadata %>% 
+  count(BMI_status)
+# WC
+Col_metadata %>% 
+  count(Waist_Circumference_status)
+#BF
+Col_metadata %>% 
+  count(Fat_percentage_status)
+```
+
+Since there are strong unbalances in the sizes of WC and BF% categories, I will perform the following tests for those variables splitting them by tertiles. Note that the tertiles are calculated for each sex separately.
+
+```{r}
+# Create df with explanatory variables to test
+# Group WC and BF by tertiles
+Bdiv_vars = Col_metadata %>% 
+  group_by(Sex) %>% 
+  mutate(Fat_percentage_tertiles = case_when(Fat_percentage <= quantile(Fat_percentage, 1/3) ~ "lower",
+                                             Fat_percentage >= quantile(Fat_percentage, 2/3) ~ "higher",
+                                             TRUE ~ "middle"),
+         Waist_Circumference_tertiles = case_when(Waist_Circumference <= quantile(Waist_Circumference, 1/3) ~ "lower",
+                                             Waist_Circumference >= quantile(Waist_Circumference, 2/3) ~ "higher",
+                                             TRUE ~ "middle")) %>% 
+  ungroup() %>% 
+  select(BMI_status, 
+         chs_class, 
+         bsp_class,
+         Waist_Circumference_status,
+         Waist_Circumference_tertiles, 
+         Fat_percentage_status,
+         Fat_percentage_tertiles)
+
+Bdiv_vars %>% 
+  head
+```
+
+
+```{r}
+# Execute Bdiv function on all variables
+Bdiv_results = map(Bdiv_vars, function(x) Bdiv_test(module_distances, x, n_cores = 16))
+```
+
+
+```{r}
+# Results of marginal Bdisper and Permanova on each of the tested variables
+Bdiv_df = Bdiv_results %>% 
+  map_df(function(x) slice(x$permanova, 1)) %>% 
+  mutate(Variable = colnames(Bdiv_vars)) %>% 
+  relocate(Variable)
+
+rownames(Bdiv_df) = NULL
+
+Bdiv_df %>% 
+  mutate(R2_adj = RsquareAdj(x = R2, n = 408, m = Df)) %>% 
+  arrange(R2_adj)
+```
+
+### Variance partitioning
+```{r}
+# Partition variance of Ob measures and CHS
+VarPart_vars = Bdiv_vars %>%
+  select(BMI_status, 
+         Waist_Circumference_tertiles, 
+         Fat_percentage_tertiles) 
+
+VarPart_results = map(VarPart_vars, function(Ob_variable){
+  varpart(module_distances, ~Ob_variable, ~chs_class, data = Col_metadata)
+})
+
+names(VarPart_results) = colnames(VarPart_vars)
+
+VarPart_results$BMI_status
+
+
+```
+
+### Plots by category
+```{r fig.height=5, fig.width=11}
+# Plot with phenotype data
+Mod_PCA_BMI = module_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$BMI_status)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2), 
+         color = "BMI status") +
+    scale_color_viridis_d(option = "plasma", end = 0.85) +
+    theme(legend.position = "bottom", 
+          panel.border = element_rect(fill = NA, color = "lightgrey"))
+
+Mod_PCA_CHS = module_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$chs_class)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2), 
+         color = "CHS") +
+    scale_color_viridis_d(option = "magma", begin = 0.2, end = 0.75, direction = -1) +
+    theme(legend.position = "bottom", 
+          panel.border = element_rect(fill = NA, color = "lightgrey")) 
+
+Mod_PCA_BSP = module_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$BMI_status, pch = Col_metadata$chs_class)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2), 
+         color = "BMI status", pch = "Cardiometabolic status") +
+    scale_color_viridis_d(option = "viridis", end = 0.95) +
+    theme(legend.position = "bottom", 
+          panel.border = element_rect(fill = NA, color = "lightgrey")) 
+# 
+# module_PCA_axes %>%
+#     ggplot(aes(x = V1, y = V2, color =  Col_metadata$bsp_class)) +
+#     geom_point() +
+#     theme_minimal() +
+#     labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2)) +
+#     scale_color_viridis_d(option = "magma", end = 0.85)
+
+#Mod_PCA_combined = plot_grid(Mod_PCA_BMI, Mod_PCA_CHS, Mod_PCA_BSP, ncol =3, align = "v")
+Mod_PCA_combined = plot_grid(Mod_PCA_BMI, Mod_PCA_CHS,  ncol = 2, align = "v")
+Mod_PCA_combined
+
+save_plot(file.path(fig_dir, "Mod_PCA_plot.png"), Mod_PCA_combined, base_width = 11, base_height = 5)
+```
+
+
+## Orthologs
+```{r}
+# Perform principal component analysis
+ortholog_distances = Col_ortho_clr %>% 
+  column_to_rownames("Sample") %>% 
+    dist(method = "euclidean")
+
+ortholog_PCoA = cmdscale(ortholog_distances, k = 3, eig = T)
+
+# Percentage of variance explained by each component
+orth_PCos = round(ortholog_PCoA$eig/sum(ortholog_PCoA$eig), 4)* 100
+
+# Obtain % of variance of each axis
+orth_PC1 = orth_PCos %>% nth(1)
+orth_PC2 = orth_PCos %>% nth(2)
+orth_PC3 = orth_PCos %>% nth(3)
+
+ortholog_PCA_axes = ortholog_PCoA$points %>% 
+    as.data.frame
+
+# Graph PCo1 and PCo2
+ortholog_PCA_plot = ortholog_PCA_axes %>% 
+    ggplot(aes(x = V1, y = V2)) +
+    geom_point() + 
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = orth_PC1), y = glue("PCo2 ({vr}%)", vr = orth_PC2))
+
+ortholog_PCA_plot
+
+#save_plot(file.path(fig_dir, "ortholog_PCA_plot.png"), ortholog_PCA_plot, base_width = 8, base_height = 4)
+```
+
+### Betadisper and PERMANOVA
+```{r}
+Bdiv_results_ortho = map(Bdiv_vars, function(x) Bdiv_test(ortholog_distances, x, n_cores = 16))
+```
+
+```{r}
+# Results of marginal Bdisper and Permanova on each of the tested variables
+Bdiv_df_ortho = Bdiv_results_ortho %>% 
+  map_df(function(x) slice(x$permanova, 1)) %>% 
+  mutate(Variable = colnames(Bdiv_vars)) %>% 
+  relocate(Variable)
+
+rownames(Bdiv_df_ortho) = NULL
+
+Bdiv_df_ortho %>% 
+  mutate(R2_adj = RsquareAdj(x = R2, n = 408, m = Df)) %>% 
+  arrange(R2_adj)
+```
+
+```{r}
+Bdiv_df %>% 
+  mutate(R2_adj = RsquareAdj(x = R2, n = 408, m = Df)) %>% 
+  arrange(R2_adj)
+
+Bdiv_df_ortho %>% 
+  mutate(R2_adj = RsquareAdj(x = R2, n = 408, m = Df)) %>% 
+  arrange(R2_adj)
+```
+
+
+### Variance partitioning
+```{r}
+# Partition variance of Ob measures and CHS
+VarPart_vars = Bdiv_vars %>%
+  select(BMI_status, 
+         Waist_Circumference_tertiles, 
+         Fat_percentage_tertiles) 
+
+VarPart_results_ortho = map(VarPart_vars, function(Ob_variable){
+  varpart(ortholog_distances, ~Ob_variable, ~chs_class, data = Col_metadata)
+})
+
+names(VarPart_results_ortho) = colnames(VarPart_vars)
+
+VarPart_results_ortho$BMI_status
+VarPart_results$BMI_status
+```
+
+### Plots
+
+```{r fig.width=7, fig.height=10}
+# Plot with phenotype data
+Orth_PCA_BMI = ortholog_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$BMI_status)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2)) +
+    scale_color_viridis_d(option = "plasma", end = 0.85)
+
+Orth_PCA_CHS = ortholog_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$chs_class)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2)) +
+    scale_color_viridis_d(option = "magma", begin = 0.2, end = 0.75, direction = -1)
+
+Orth_PCA_BSP = ortholog_PCA_axes %>%
+    ggplot(aes(x = V1, y = V2, color = Col_metadata$BMI_status, pch = Col_metadata$chs_class)) +
+    geom_point() +
+    theme_minimal() +
+    labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2)) +
+    scale_color_viridis_d(option = "viridis", end = 0.95)
+# 
+# ortholog_PCA_axes %>%
+#     ggplot(aes(x = V1, y = V2, color =  Col_metadata$bsp_class)) +
+#     geom_point() +
+#     theme_minimal() +
+#     labs(x = glue("PCo1 ({vr}%)", vr = mod_PC1), y = glue("PCo2 ({vr}%)", vr = mod_PC2)) +
+#     scale_color_viridis_d(option = "magma", end = 0.85)
+
+Orth_PCA_combined = plot_grid(Orth_PCA_BMI, Orth_PCA_CHS, Orth_PCA_BSP, nrow =3, align = "v")
+Orth_PCA_combined
+```

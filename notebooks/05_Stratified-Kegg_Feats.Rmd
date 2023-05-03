@@ -1,0 +1,493 @@
+---
+title: "KEGG stratified data"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta-Zuluaga. March 2021.
+
+The aim of this notebook is to prepare the stratified outputs of HUMANn2, KEGG orthologs and modules. I will transform the tables using the centered-log-ratio and filter the candidate orthologs and modules to then use for the analysis of the contribution of different taxa to the functional profile of the microbiome.
+
+# Init
+Load packages
+```{r}
+# General
+library(conflicted)
+
+# CODA
+library(propr)
+library(zCompositions)
+
+# Data manipulation
+library(glue)
+library(furrr)
+library(vegan)
+library(tidyverse)
+library(LeyLabRMisc)
+library(data.table)
+library(ggthemes)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("between", "dplyr")
+conflict_prefer("first", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+```
+
+Seed
+```{r}
+set.seed(1990)
+```
+
+## Load tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+#nonpareil_table_file = file.path(base_dir, "/data/intermediate_files/2019_01_combined/nonpareil/2019_01_coverage.tsv")
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+# Colombian samples retained
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+   read_tsv()
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+```
+
+```{r}
+# GTDB metadata
+gtdb_bac = "/ebio/abt3_projects/databases_no-backup/GTDB/release89/metadata/bac120_metadata_r89.tsv" %>% 
+  read_tsv() %>% 
+  filter(gtdb_representative == TRUE) %>% 
+  select(accession, gtdb_taxonomy, ncbi_taxonomy) %>% 
+  separate(gtdb_taxonomy, into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";")
+
+gtdb_arc = "/ebio/abt3_projects/databases_no-backup/GTDB/release89/metadata/ar122_metadata_r89.tsv" %>% 
+  read_tsv() %>% 
+  filter(gtdb_representative == TRUE) %>% 
+  select(accession, gtdb_taxonomy, ncbi_taxonomy) %>% 
+  separate(gtdb_taxonomy, into = c("Domain", "Phylum", "Class", "Order", "Family", "Genus", "Species"), sep = ";")
+
+gtdb_taxonomy = bind_rows(gtdb_bac, gtdb_arc)
+
+gtdb_taxonomy %>% head()
+```
+
+
+## Load result tables
+### Modules
+```{r}
+# OB modules
+ob_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/ob_uniq_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# CHS modules
+chs_mod_meds  = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/chs_uniq_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# Core shared modules
+core_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/core_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+```
+
+# Prepare contributional diversity tables
+## Table with relative abundance on each sample
+This is similar to the functional profile table but stratified by contributing taxon
+```{r}
+strat_mod_raw = file.path(LLMGP_dir, "kegg_modules/kegg_modules_strat.tsv.gz") %>% 
+  fread(data.table = FALSE) %>% 
+  rename("Feature" = "# Gene Family")
+
+# Prepare table, transpose, fix names and fix an issue with species names that have multiple
+# underscore characters `_`
+# Add full GTDB r89 taxonomy to the stratified data
+strat_mod_relabund = strat_mod_raw %>% 
+  prep_table() %>% 
+  column_to_rownames("Feature") %>% 
+  vegan::decostand(method = "total", MARGIN = 2) %>% 
+  rownames_to_column("Feature") %>%  
+  select(Feature, all_of(Col_retain)) %>% 
+  mutate(Feature = str_replace(Feature, "\\|", "\\~"),
+         Feature = str_replace(Feature, "__taxID", "\\~")) %>% 
+  separate(Feature, into = c("Feature", "Taxonomy", "taxID"), sep = "~") %>% 
+  separate(Taxonomy, into = c("Genus", "Species"), sep = "\\.") %>% 
+  mutate(Species = str_replace(Species, "__", "~"),
+         Species = str_replace(Species, "(?<=[:upper:])_", " "), 
+         Species = str_replace(Species, "_(?=[:lower:])", " "),
+         Species = str_replace(Species, "~", "__"))
+
+strat_mod_relabund %>% head
+  
+```
+
+## DF with set association information for each module
+```{r}
+# Create a single table with info about which modules belong in which sets
+# OB modules
+ob_mod_wide = ob_mod_meds %>% 
+  select(feature, quick_assoc, metadata) %>% 
+  mutate(set = "Unique", 
+         adj = "chs_class") %>% 
+  pivot_wider(names_from = metadata, values_from = metadata) %>% 
+  mutate(across(c(BMI, Waist_Circumference, Fat_percentage), function(x) ifelse(is.na(x), FALSE, TRUE)))
+
+
+# CHS modules
+chs_mod_wide = chs_mod_meds  %>% 
+  select(feature, quick_assoc, chs_class = metadata, adj) %>% 
+  mutate(set = "Unique", 
+         chs_class = ifelse(is.na(chs_class), FALSE, TRUE))
+
+# Core shared modules
+shared_mod_wide = core_mod_meds %>% 
+  select(feature, quick_assoc, metadata = adj) %>% 
+  mutate(set = "Shared") %>% 
+  pivot_wider(names_from = metadata, values_from = metadata) %>% 
+  mutate(across(c(BMI, Waist_Circumference, Fat_percentage), function(x) ifelse(is.na(x), FALSE, TRUE)),
+         adj = "chs_class")
+
+
+modules_set_wide = bind_rows(ob_mod_wide, chs_mod_wide, shared_mod_wide) %>% 
+  mutate(across(where(is.logical), function(x) ifelse(is.na(x), FALSE, x))) %>% 
+  rename("Feature" = "feature")
+
+modules_set_wide %>% head
+```
+
+## Table with info of each taxon contributing to each module
+```{r}
+# Calculate mean abundance of each stratified module
+mod_mean_abund = strat_mod_relabund %>% 
+  select(where(is.numeric)) %>% 
+  LeyLabRMisc::row_means()
+
+# Create table with strat module data and mean abund
+# Using all contributing taxa
+mod_contr = strat_mod_relabund %>% 
+  mutate(mean_abund = mod_mean_abund) %>% 
+  select(Feature, Genus, Species, taxID, mean_abund)
+
+# Add taxonomy of contributor
+# Remove ungrouped
+mod_contr_tax = left_join(mod_contr, gtdb_taxonomy, by = c("Genus", "Species")) %>% 
+  relocate(Feature, Phylum, Family, Species, mean_abund) %>% 
+  arrange(Feature, -mean_abund) %>% 
+  filter(!str_detect(Feature, "UNGROUPED"))
+
+mod_contr_tax %>% head
+```
+
+## Calculate total contributional diversity per module
+```{r}
+# Create data frame with total contributional diversity per module
+mod_contr_div = mod_contr_tax %>% 
+  count(Feature, name = "cont_div") %>% 
+  left_join(modules_set_wide, ., by = "Feature") %>% 
+  arrange(Feature)
+
+```
+
+```{r fig.width=5, fig.height=7} 
+mod_contr_div_pltdf = mod_contr_div %>% 
+  pivot_longer(cols = c(BMI, Waist_Circumference, Fat_percentage), values_to = "Present", names_to = "Ob") %>% 
+  filter(Present == TRUE) %>% 
+  mutate(Ob = case_when(Ob == "Waist_Circumference" ~ "WC",
+                        Ob == "Fat_percentage" ~ "BF%",
+                        TRUE ~ Ob), 
+         Ob = factor(Ob, levels = c("BMI", "WC", "BF%")), 
+         set = factor(set, levels = c("Unique", "Shared")))
+
+Contr_div_plt = mod_contr_div_pltdf %>% 
+  ggplot(aes(x = quick_assoc, y = cont_div, color = quick_assoc)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.8) + #, color = "darkgrey"
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1), geom="pointrange", color="black") +
+    scale_color_manual(values = c(Disease = '#700548', Health = "#A7ADC6")) +
+    theme_light() +
+    facet_wrap(set~Ob) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          strip.background = element_rect(colour="black", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          panel.border = element_rect(fill = NA),
+          legend.position = "none") +
+  labs(x = "Health association direction", y = "Module contributional diversity") +
+  coord_cartesian(ylim = c(0, 7000))
+
+Contr_div_plt
+
+cowplot::save_plot(file.path(fig_dir, "Contr_div_mod.png"), 
+                   Contr_div_plt,
+                   base_height = 7, base_width = 5)
+```
+
+```{r}
+mod_contr_div_pltdf %>% 
+  group_by(Ob, set, quick_assoc) %>% 
+  summarise(mean_contr = mean(cont_div), sd_contr = sd(cont_div)) %>% 
+  mutate(across(is.numeric, function(x) round(x, 2)))
+
+mod_contr_div_pltdf %>% 
+  group_by(set, Ob) %>% 
+  rstatix::wilcox_test(cont_div ~ quick_assoc,
+                       p.adjust.method = "BH") %>% 
+  rstatix::adjust_pvalue() %>% 
+  rstatix::add_significance() %>% 
+  relocate(set, Ob, p.adj, p.adj.signif)
+```
+
+```{r}
+mod_contr_div_chs = mod_contr_div %>% 
+  pivot_longer(cols = c(chs_class), values_to = "Present", names_to = "Ob") %>% 
+  filter(Present == TRUE) %>% 
+  mutate(adj = case_when(adj == "Waist_Circumference" ~ "WC",
+                         adj == "Fat_percentage" ~ "BF%",
+                        TRUE ~ adj), 
+         adj = factor(adj, levels = c("BMI", "WC", "BF%")), 
+         set = factor(set, levels = c("Unique", "Shared")))
+```
+
+
+
+```{r}
+mod_contr_div_chs %>% 
+  ggplot(aes(x = quick_assoc, y = cont_div, color = quick_assoc)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.8) + #, color = "darkgrey"
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1), geom="pointrange", color="black") +
+    scale_color_manual(values = c(Disease = '#700548', Health = "#A7ADC6")) +
+    theme_light() +
+    facet_wrap(~adj, scales = "free_x") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          strip.background = element_rect(colour="black", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          panel.border = element_rect(fill = NA),
+          legend.position = "none") +
+  labs(x = "Health association direction", y = "Module contributional diversity")
+```
+
+
+## Calculate contributional diversity attributable to Phyla
+```{r}
+# Create data frame with following data for each module
+# Association, set, ob measure and # of taxa of a given phylum contributing to the module
+mod_contr_phylum = mod_contr_tax %>% 
+  group_by(Feature, Phylum) %>%
+  summarise(n = n()) %>% 
+  mutate(freq = n / sum(n)*100, 
+         freq = round(freq, 2)) %>% 
+  ungroup() %>% 
+  left_join(modules_set_wide, ., by = "Feature") %>% 
+  arrange(Feature)
+
+mod_contr_phylum %>% 
+  dfhead()
+```
+
+
+```{r fig.width=5, fig.height=7} 
+mod_contr_phylum_pltdf = mod_contr_phylum %>% 
+  pivot_longer(cols = c(BMI, Waist_Circumference, Fat_percentage), values_to = "Present", names_to = "Ob") %>% 
+  filter(Present == TRUE) %>% 
+  mutate(Ob = case_when(Ob == "Waist_Circumference" ~ "WC",
+                        Ob == "Fat_percentage" ~ "BF%",
+                        TRUE ~ Ob), 
+         Ob = factor(Ob, levels = c("BMI", "WC", "BF%")), 
+         set = factor(set, levels = c("Unique", "Shared")))
+```
+
+
+### Plot
+```{r fig.width=5, fig.height=7} 
+Proteo_contribution_plt = mod_contr_phylum_pltdf %>% 
+  filter(Phylum == "p__Proteobacteria") %>% 
+  ggplot(aes(x = quick_assoc, y = freq, color = quick_assoc)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.8) + #, color = "darkgrey"
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1), geom="pointrange", color="black") +
+    scale_color_manual(values = c(Disease = '#700548', Health = "#A7ADC6")) +
+    theme_light() +
+    facet_wrap(set~Ob) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          strip.background = element_rect(colour="black", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          panel.border = element_rect(fill = NA),
+          legend.position = "none") +
+    labs(x = "Health association direction", y = "Module contributional diversity\nfrom Proteobacteria (%)") +
+    coord_cartesian(ylim = c(0, 110))
+
+Proteo_contribution_plt
+
+cowplot::save_plot(file.path(fig_dir, "Proteo_contribution_mod.png"), 
+                   Proteo_contribution_plt,
+                   base_height = 7, base_width = 5)
+```
+
+### Test differences in Proteobacteria abundance
+```{r}
+mod_contr_phylum_pltdf %>% 
+  filter(Phylum == "p__Proteobacteria") %>% 
+  group_by(Ob, set, quick_assoc) %>% 
+  summarise(mean_proteo = mean(freq), sd_proteo = sd(freq)) %>% 
+  mutate(across(is.numeric, function(x) round(x, 2)))
+
+mod_contr_phylum_pltdf %>% 
+  filter(Phylum == "p__Proteobacteria") %>% 
+  group_by(set, Ob) %>% 
+  rstatix::wilcox_test(freq ~ quick_assoc,
+                       p.adjust.method = "BH") %>% 
+  rstatix::adjust_pvalue() %>% 
+  rstatix::add_significance() %>% 
+  relocate(set, Ob, p.adj, p.adj.signif)
+```
+## Calculate contributional diversity attributable to Families
+```{r}
+# Create data frame with following data for each module
+# Association, set, ob measure and # of taxa of a given Class contributing to the module
+mod_contr_family = mod_contr_tax %>% 
+  group_by(Feature, Family) %>%
+  summarise(n = n()) %>% 
+  mutate(freq = n / sum(n)*100, 
+         freq = round(freq, 2)) %>% 
+  ungroup() %>% 
+  left_join(modules_set_wide, ., by = "Feature") %>% 
+  arrange(Feature)
+
+mod_contr_family %>% 
+  dfhead()
+```
+
+
+```{r fig.width=5, fig.height=7} 
+mod_contr_family_pltdf = mod_contr_family %>% 
+  pivot_longer(cols = c(BMI, Waist_Circumference, Fat_percentage), values_to = "Present", names_to = "Ob") %>% 
+  filter(Present == TRUE) %>% 
+  mutate(Ob = case_when(Ob == "Waist_Circumference" ~ "WC",
+                        Ob == "Fat_percentage" ~ "BF%",
+                        TRUE ~ Ob), 
+         Ob = factor(Ob, levels = c("BMI", "WC", "BF%")), 
+         set = factor(set, levels = c("Unique", "Shared")))
+```
+
+
+### Plot
+```{r fig.width=5, fig.height=7} 
+Enteros_contribution_plt = mod_contr_family_pltdf %>% 
+  filter(Family == "f__Enterobacteriaceae") %>% 
+  ggplot(aes(x = quick_assoc, y = freq, color = quick_assoc)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.8) + #, color = "darkgrey"
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1), geom="pointrange", color="black") +
+    scale_color_manual(values = c(Disease = '#700548', Health = "#A7ADC6")) +
+    theme_light() +
+    facet_wrap(set~Ob) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          strip.background = element_rect(colour="black", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          panel.border = element_rect(fill = NA),
+          legend.position = "none") +
+    labs(x = "Health association direction", y = "Module contributional diversity\nfrom Enterobacteriaceae (%)") +
+    coord_cartesian(ylim = c(0, 110))
+
+Enteros_contribution_plt
+
+
+cowplot::save_plot(file.path(fig_dir, "Enteros_contribution_mod.png"), 
+                   Enteros_contribution_plt,
+                   base_height = 7, base_width = 5)
+
+```
+
+### Test differences in Enterobacteriaceae abundance
+```{r}
+mod_contr_family_pltdf %>% 
+  filter(Family == "f__Enterobacteriaceae") %>% 
+  group_by(Ob, set, quick_assoc) %>% 
+  summarise(mean_entero = mean(freq), sd_entero = sd(freq)) %>% 
+  mutate(across(is.numeric, function(x) round(x, 2)))
+
+mod_contr_family_pltdf %>% 
+  filter(Family == "f__Enterobacteriaceae") %>% 
+  group_by(set, Ob) %>% 
+  rstatix::wilcox_test(freq ~ quick_assoc,
+                       p.adjust.method = "BH") %>% 
+  rstatix::adjust_pvalue() %>% 
+  rstatix::add_significance() %>% 
+  relocate(set, Ob, p.adj, p.adj.signif)
+```
+
+# CHS
+
+```{r fig.width=5, fig.height=7} 
+mod_contr_phylum_chs = mod_contr_phylum %>% 
+  pivot_longer(cols = c(chs_class), values_to = "Present", names_to = "Ob") %>% 
+  filter(Present == TRUE) %>% 
+  mutate(adj = case_when(adj == "Waist_Circumference" ~ "WC",
+                         adj == "Fat_percentage" ~ "BF%",
+                        TRUE ~ adj), 
+         adj = factor(adj, levels = c("BMI", "WC", "BF%")), 
+         set = factor(set, levels = c("Unique", "Shared")))
+```
+
+```{r fig.width=5, fig.height=7} 
+mod_contr_phylum_chs %>% 
+  filter(Phylum == "p__Proteobacteria") %>% 
+  ggplot(aes(x = quick_assoc, y = freq, color = quick_assoc)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.8) + #, color = "darkgrey"
+    stat_summary(fun.data=mean_se, fun.args = list(mult=1), geom="pointrange", color="black") +
+    scale_color_manual(values = c(Disease = '#700548', Health = "#A7ADC6")) +
+    theme_light() +
+    facet_wrap(~adj, scales = "free_x") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          strip.background = element_rect(colour="black", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          panel.border = element_rect(fill = NA),
+          legend.position = "none") +
+    labs(x = "Health association direction", y = "Module contributional diversity\nfrom Proteobacteria (%)")
+```

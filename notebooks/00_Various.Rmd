@@ -1,0 +1,370 @@
+---
+title: "Various code"
+output: html_notebook
+---
+
+# Goal
+
+Jacobo de la Cuesta-Zuluaga. November 2018.
+
+The goal of this notebook is to hold small snippets of code used to download or fix needed files for the functional profile analyses.
+
+# Kegg Orthologs to Kegg modules
+## Init
+```{r}
+library(tidyverse)
+library(LeyLabRMisc)
+library(glue)
+```
+
+## Var
+```{r}
+# Dirs and files
+work_dir = "/ebio/abt3_projects/columbian_gut_metagenome/data/metagenome_profile/2020_04_combined/humann2/kegg_modules/"
+humann2_outdir = "/ebio/abt3_projects/columbian_gut_metagenome/data/metagenome_profile/2020_04_combined/humann2/"
+utility_mapping = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+module_map_url = "https://raw.githubusercontent.com/biobakery/humann_legacy/master/data/modulec"
+module_map = file.path(work_dir, "kegg_module_legacy.tsv")
+
+# Conda env containing HUMANn2
+conda_env = "humann2_vschmidt"
+```
+
+## Prepare files
+```{r}
+# Copy Kegg mapping files to work dir
+utility_mapping %>% 
+  list_files(path = ., pattern = "map_k") %>% 
+  file.copy(work_dir)
+
+# Copy HUMANn2 UniRef50 output file
+file.path(humann2_outdir, "unnormalized/unstratified/regroup/genefamilies_uniref50_default.tsv.gz") %>% 
+  file.copy(work_dir)
+
+# UniRef to KEGG orthologs map
+UniRef_KO_map = file.path(work_dir, "map_ko_uniref50.txt.gz")
+```
+
+```{r}
+# Download mapping file from humann1 legacy repo
+# See https://github.com/biobakery/humann_legacy
+wget_cmd = glue::glue("wget {url} -O {file}", url = module_map_url, file = module_map)
+system(wget_cmd)
+```
+
+```{r}
+## Modify genefamilies file to remove annotation
+uniref50_file = file.path(work_dir, "genefamilies_uniref50_default.tsv.gz")
+uniref50_modfile = file.path(work_dir, "genefamilies_uniref50_modified.tsv.gz")
+
+# Read file
+uniref_50_raw = uniref50_file %>% 
+  read_tsv()
+
+# Remove annotation from first column
+uniref_50_mod = uniref_50_raw %>% 
+  mutate(`# Gene Family` = str_remove(`# Gene Family`, "\\:.*"))
+
+# Save file
+write_tsv(uniref_50_mod, uniref50_modfile)
+
+# Alternarively, run on the console
+# zcat genefamilies_uniref50_default.tsv.gz | awk -F "\t" '{sub(/\:.*/, "", $1)}1' > genefamilies_uniref50_modified.tsv; gzip genefamilies_uniref50_modified.tsv
+```
+
+## Transform modules
+```{r}
+# Output files
+# KEGG orthologs
+orthologs_file = file.path(work_dir, "kegg_orthologs.tsv")
+modules_file = file.path(work_dir, "kegg_modules.tsv")
+modules_relabund_file = file.path(work_dir, "kegg_modules_relabund.tsv")  
+  
+# UniRef50 to KEGG orthologs
+glue("humann2_regroup_table -i {UniRef50} -c {UniRef2KO} -o {Ortolog_out}", 
+     UniRef50 = uniref50_modfile, UniRef2KO = UniRef_KO_map, Ortolog_out = orthologs_file) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+# KEGG orthologs to KEGG modules
+glue("humann2_regroup_table -i {Ortolog_out} -c {KO2Modules} -o {Module_out}", 
+     Ortolog_out = orthologs_file, KO2Modules = module_map, Module_out = modules_file) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+# KEGG modules as relative abundances
+#humann2_renorm_table -i kegg_modules.txt -o kegg_modules_relabund.txt -u relab
+glue("humann2_renorm_table -i {Module_out}  -o {Module_relabund} -u relab", 
+     Module_out = modules_file, Module_relabund = modules_relabund_file ) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+```
+
+# ------------------------------------------------------------------------------
+
+# Kegg Orthologs to Kegg modules with stratified data
+## Init
+```{r}
+library(tidyverse)
+library(LeyLabRMisc)
+library(glue)
+library(data.table)
+```
+
+## Var
+```{r}
+# Dirs and files
+work_dir = "/ebio/abt3_projects/columbian_gut_metagenome/data/metagenome_profile/2020_04_combined/humann2/kegg_modules"
+humann2_outdir = "/ebio/abt3_projects/columbian_gut_metagenome/data/metagenome_profile/2020_04_combined/humann2"
+utility_mapping = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+module_map_url = "https://raw.githubusercontent.com/biobakery/humann_legacy/master/data/modulec"
+module_map = file.path(work_dir, "kegg_module_legacy.tsv")
+
+# Conda env containing HUMANn2
+conda_env = "humann2_vschmidt"
+```
+
+## Prepare files
+```{r}
+# Copy Kegg mapping files to work dir
+utility_mapping %>% 
+  list_files(path = ., pattern = "map_k") %>% 
+  file.copy(work_dir)
+
+# Copy HUMANn2 UniRef50 output file
+file.path(humann2_outdir, "unnormalized/stratified/regroup/genefamilies_uniref50_default.tsv.gz") %>% 
+  file.copy(to = file.path(work_dir, "genefamilies_uniref50_strat.tsv.gz"))
+
+# UniRef to KEGG orthologs map
+UniRef_KO_map = file.path(work_dir, "map_ko_uniref50.txt.gz")
+```
+
+```{r}
+# Download mapping file from humann1 legacy repo
+# See https://github.com/biobakery/humann_legacy
+wget_cmd = glue::glue("wget {url} -O {file}", url = module_map_url, file = module_map)
+system(wget_cmd)
+```
+
+```{r}
+## Modify genefamilies file to remove annotation
+uniref50_stratfile = file.path(work_dir, "genefamilies_uniref50_strat.tsv.gz")
+uniref50_modstratfile = file.path(work_dir, "genefamilies_uniref50_modstrat.tsv.gz")
+
+# Read file
+uniref_50_raw_strat = uniref50_stratfile %>% 
+  fread(data.table = FALSE)
+
+# Remove annotation from first column
+uniref_50_modstrat = uniref_50_raw_strat %>% 
+  mutate(`# Gene Family` = str_replace(`# Gene Family`, "\\:(.*)\\|", "\\|"))
+
+uniref_50_modstrat %>% head
+
+# Save file
+fwrite(uniref_50_modstrat, uniref50_modstratfile, sep = "\t")
+```
+
+## Transform modules
+```{r}
+# Output files
+# KEGG orthologs
+orthologs_stratfile = file.path(work_dir, "kegg_orthologs_strat.tsv")
+modules_stratfile = file.path(work_dir, "kegg_modules_strat.tsv")
+modules_relabund_stratfile = file.path(work_dir, "kegg_modules_relabund_strat.tsv")  
+  
+# UniRef50 to KEGG orthologs
+glue("humann2_regroup_table -i {UniRef50} -c {UniRef2KO} -o {Ortolog_out}", 
+     UniRef50 = uniref50_modstratfile, UniRef2KO = UniRef_KO_map, Ortolog_out = orthologs_stratfile) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+# KEGG orthologs to KEGG modules
+glue("humann2_regroup_table -i {Ortolog_out} -c {KO2Modules} -o {Module_out}", 
+     Ortolog_out = orthologs_stratfile, KO2Modules = module_map, Module_out = modules_stratfile) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+# KEGG modules as relative abundances
+#humann2_renorm_table -i kegg_modules.txt -o kegg_modules_relabund.txt -u relab
+# glue("humann2_renorm_table -i {Module_out}  -o {Module_relabund} -u relab", 
+#      Module_out = modules_stratfile, Module_relabund = modules_relabund_stratfile ) %>% 
+#   bash_job(cmd = ., conda_env = conda_env)
+```
+
+## Compress files
+```{r}
+glue("gzip --best  {file}", file = orthologs_stratfile) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+glue("gzip --best  {file}", file = modules_stratfile) %>% 
+  bash_job(cmd = ., conda_env = conda_env)
+
+# glue("gzip --best  {file}", file = modules_relabund_stratfile) %>% 
+#   bash_job(cmd = ., conda_env = conda_env)
+```
+
+
+# ------------------------------------------------------------------------------
+# Tables for manuscript
+## Host parameters table
+A.K.A. table one
+### Libraries
+```{r}
+library(tidyverse)
+library(tableone)
+library(LeyLabRMisc)
+library(conflicted)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+### Load tables
+```{r}
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+metadata_dir = file.path(base_dir, "data/metadata")
+```
+
+```{r}
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+# Colombian samples retained
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+   read_tsv()
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                           "Overweight-Healthy", "Overweight-Abnormal",
+                                           "Obese-Healthy", "Obese-Abnormal")))
+
+
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+
+Col_metadata %>% dfhead()
+
+# Data frame for sensitivity analysis
+Col_metadata_sens = Col_metadata %>% 
+  filter(n_med == 0)
+```
+
+## Create table
+Vars to include in table
+
+```{r}
+table_vars = c("Age", "Sex", "City", "BMI", "Fat_percentage", "Waist_Circumference",
+               "Systolic_bp", "Diastolic_bp", "Hypertension_med", "Diabetes_med",
+               "Dislipid_med", "PPI_med", "Total_cholesterol", "HDL", "LDL", 
+               "Triglycerides", "ApoB", "LpA","Glucose", "HbA1c", "Insulin", 
+               "HOMA_IR", "Leptin", "Adiponectin", "LBP", "hsCRP", 
+               "acetic", "propionic", "isobutyric", "butyric")
+```
+
+```{r}
+# Create table one
+tableone_metadata = Col_metadata %>% 
+  mutate(Fat_percentage = Fat_percentage*100, 
+         HbA1c = HbA1c*100, 
+         LBP = LBP/1000)
+
+CreateTableOne(vars = table_vars, data = tableone_metadata, 
+               strata = "BMI_status", addOverall = TRUE) %>% 
+  print(quote = FALSE, noSpaces = TRUE, printToggle = FALSE) %>% 
+  write.csv(x = ., quote = FALSE,
+            file = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/BMI_Tableone_Manuscript.csv"))
+
+
+CreateTableOne(vars = table_vars, data = tableone_metadata, 
+               strata = "chs_class", addOverall = TRUE) %>% 
+  print(quote = FALSE, noSpaces = TRUE, printToggle = FALSE) %>% 
+  write.csv(x = ., quote = FALSE,
+            file = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/CHS_Tableone_Manuscript.csv"))
+  
+#CreateTableOne(vars = table_vars, data = Col_metadata_sens, strata = "chs_class", addOverall = TRUE)
+```
+
+
+```{r}
+Col_metadata %>% 
+  summarise(CV_BF = sd(Fat_percentage)/mean(Fat_percentage),
+            CV_BMI = sd(BMI)/mean(BMI))
+```
+
+# Map of Colombia and cities
+
+This was run locally. Adding it here to have a backup.
+
+
+```
+library(tidyverse)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(ggspatial)
+library(maps)
+library(maptools)
+
+Cities_df = world.cities %>% 
+    filter(country.etc == "Colombia", 
+           name %in% c("Bogota", "Medellin", "Cali", "Barranquilla", "Bucaramanga"))
+
+
+
+Cities_sf = st_as_sf(Cities_df, coords = c("long", "lat"), crs = 4326, agr = "constant")
+
+Colombia = st_as_sf(map(regions = "Colombia", plot = F, fill = T))
+Colombia$area = as.numeric(st_area(Colombia))
+```
+
+```
+Cities_plt = Cities_df %>% 
+    mutate(nudge_x = 2, nudge_y = 0)
+
+Cities_plt$nudge_x[Cities_plt$name == "Bogota"] = 1.45
+Cities_plt$nudge_x[Cities_plt$name == "Medellin"] = 1.6
+Cities_plt$nudge_x[Cities_plt$name == "Cali"] = 1
+Cities_plt$nudge_x[Cities_plt$name == "Barranquilla"] = 2.1
+Cities_plt$nudge_x[Cities_plt$name == "Bucaramanga"] = 2.33
+
+Cities_plt$nudge_y[Cities_plt$name == "Bucaramanga"] = 0
+Cities_plt$nudge_y[Cities_plt$name == "Medellin"] = 0
+
+Col_map = ggplot(data = world) +
+  geom_sf(fill= "antiquewhite1") + 
+    geom_sf(data = Colombia, fill = "salmon") +
+    geom_sf(data = Cities_sf, size = 4, shape = 21, fill = "steelblue3") + 
+    geom_label(data = Cities_df, aes(long, lat, label = name), 
+               size = 4, fontface = "bold", 
+               nudge_x = Cities_plt$nudge_x, nudge_y = Cities_plt$nudge_y) +
+    theme_bw() +
+    coord_sf(xlim = c(-83, -63), ylim = c(15, -5)) +
+    annotation_scale(location = "bl", width_hint = 0.2) + 
+    annotation_north_arrow(location = "tr", which_north = "true",  style = north_arrow_fancy_orienteering) +
+    theme(panel.grid.major = element_line(color = gray(.5), linetype = "dashed", size = 0.5), panel.background = element_rect(fill = "aliceblue")) +
+    labs(x = "Longitude", y = "Latitude")
+
+Col_map
+
+cowplot::save_plot("/Users/jdelacuesta/Nextcloud/Documents/Thesis/Col_MAGs/Manuscript/Figures/Col_Map/Colombia_map_cities.png", Col_map, base_height = 7, base_width = 7)
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

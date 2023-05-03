@@ -1,0 +1,658 @@
+---
+title: "Clusters of associated microbial and host data"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. August 2021.
+
+The aim of this notebook is to find clusters of associated modules and host data using halla.
+
+# Init
+Load packages
+```{r}
+# Misc
+library(LeyLabRMisc)
+library(conflicted)
+
+# Data manipulation
+library(glue)
+library(tidyverse)
+library(data.table)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("count", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+FD_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined_FD/kraken/diversity")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+halla_dir = file.path(base_dir, "data/intermediate_files/halla")
+
+```
+
+## Software paths
+```{r}
+# Halla path
+halla_repo = file.path(base_dir, "bin/halla")
+
+# Conda with dependencies
+conda_env = "/tmp/global2/jdelacuesta/bin_central/Colombia_bin/conda_envs/halla"
+```
+
+
+## Metadata 
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+#nonpareil_table_file = file.path(base_dir, "/data/intermediate_files/2019_01_combined/nonpareil/2019_01_coverage.tsv")
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+# Colombian samples retained
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+   read_tsv()
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+```
+
+## clr-transformed abundances
+Load the clr-transformed functional profile tables. Recall to calculate the clr-transform, I removed the unmapped and the unintegrated features which are technically but not biologically relevant. See CoDa-transformations notebook.
+
+### Significant Modules
+```{r}
+# OB modules
+ob_mod_meds = file.path(tab_dir, "ob_uniq_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# CHS modules
+chs_mod_meds  = file.path(tab_dir, "chs_uniq_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# Core shared modules
+core_mod_meds = file.path(tab_dir, "core_mod_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+```
+
+```{r}
+# List of significant modules
+Sig_modules_ID = bind_rows(ob_mod_meds, chs_mod_meds, core_mod_meds) %>% 
+  select(feature) %>% 
+  distinct()
+```
+
+
+### Orthologs
+```{r}
+# OB orthologs
+ob_ortho_meds =  file.path(tab_dir, "ob_uniq_ortho_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# CHS orthologs
+chs_ortho_meds  = file.path(tab_dir, "chs_uniq_ortho_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# Core shared orthologs
+core_ortho_meds = file.path(tab_dir, "core_ortho_meds.tsv") %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+```
+
+```{r}
+# List of significant orthologs
+Sig_ortho_ID = bind_rows(ob_ortho_meds, chs_ortho_meds, core_ortho_meds) %>% 
+  select(feature) %>% 
+  distinct()
+```
+
+
+### Modules
+```{r}
+# KEGG Modules
+## Summary
+Col_module_summ = fread(file.path(tab_dir, "Candidate_Modules.tsv"), 
+                        data.table = FALSE)
+## clr-transformed data
+Col_module_clr = fread(file.path(logratios_dir, "Candidate_Modules_clr.tsv"), 
+                       data.table = FALSE)
+
+## proportionality matrix
+Col_module_rho = fread(file.path(logratios_dir, "Candidate_Modules_rho.tsv"), 
+                       data.table = FALSE)
+
+# KEGG Orthologs
+## Summary
+Col_ortho_summ = fread(file.path(tab_dir, "Candidate_Orthologs.tsv"), 
+                       data.table = FALSE)
+## clr-transformed data
+Col_ortho_clr = fread(file.path(logratios_dir, "Candidate_Orthologs_clr.tsv"), 
+                      data.table = FALSE)
+
+## proportionality matrix
+Col_ortho_rho = fread(file.path(logratios_dir, "Candidate_Orthologs_rho.tsv"), 
+                      data.table = FALSE)
+# GOMixer annots
+Col_ortho_GMM = fread(file.path(tab_dir, "Candidate_Orthologs_GMM.tsv"), 
+                      data.table = FALSE)
+
+```
+
+## Diet data
+```{r}
+# As obtained from notebook `08_Diet-Quality` based on the Garcia-Vega paper
+Col_diet_qual = file.path(metadata_dir, "Colombia_diet_quality.tsv") %>% 
+  read_tsv()
+```
+
+## Functional diversity data
+```{r}
+# Load Hill numbers table
+Hill_long_raw = file.path(FD_dir, "traitar/hill_function.tsv") %>% 
+  read_tsv() %>% 
+  mutate(sample = str_replace_all(sample, "-", "_"))
+
+# Filter
+Hill_long_full = Hill_long_raw %>% 
+  filter(sample %in% Col_retain, 
+         measure %in% c("D_q", "FD_q", "FDis")) %>% 
+  arrange(sample)
+
+# Select measures and only those corresponding to q = 1
+# This to balance the effect of rare and abund taxa on the indices values
+Hill_wide_1 = Hill_long_full %>% 
+  filter(hill_number == 1) %>% 
+  select(-hill_number) %>% 
+  mutate(measure = str_c(measure, "_h1")) %>% 
+  pivot_wider(id_cols = sample, names_from = measure)
+
+# Load FD
+FD_wide_raw = file.path(FD_dir, "traitar/FD.tsv") %>% 
+  read_tsv() %>% 
+  mutate(Sample = str_replace_all(Sample, "-", "_"), 
+         Sample = str_remove_all(Sample, "_frac"))
+
+# Filter and select Functional Evenness
+FEve_wide = FD_wide_raw %>% 
+  filter(Sample %in% Col_retain) %>% 
+  select(Sample, FEve)
+
+
+# Join tables to create single functional diversity df
+Col_Func_Div = full_join(Hill_wide_1, FEve_wide, by = c("sample" = "Sample"))
+
+Col_Func_Div %>% dfhead()
+```
+
+## See all tables
+```{r}
+# Host data
+Col_metadata %>% head()
+
+# FD
+Col_Func_Div %>% head()
+
+# Diet Qual
+Col_diet_qual %>% head()
+
+# clr transformed data
+Col_module_clr %>% head()
+Col_ortho_clr %>% head()
+
+# Sig modules
+ob_mod_meds %>% head()
+chs_mod_meds %>% head()
+core_mod_meds %>% head()
+```
+
+
+# Prepare tables for halla
+## Obtain residues after adjusting for covariates
+```{r}
+# Function to run lm on variables and extract residuals
+residuals_lm = function(variable_vec, covariate_df){
+
+  # DF for lm
+  lm_df = bind_cols(feat = variable_vec, covariate_df)
+  
+  # Extract names for formula
+  lm_formula = as.formula(paste("feat ~ ", 
+                                paste0(names(covariate_df), collapse = " + ")))
+  
+  # fit lm with covariates and extract residuals
+  feat_lm = lm(formula = lm_formula, data = lm_df)
+  feat_lm$residuals
+}
+
+# covariates df
+lm_covariates = Col_metadata %>% 
+  select(City, Age, Sex, Hypertension_med, Diabetes_med, Dislipid_med, PPI_med) #BMI, chs_class
+```
+
+```{r}
+# Host data
+Col_metadata_subset = Col_metadata %>%
+  select(ID, HDL, VLDL, LDL, Total_cholesterol, Triglycerides, ApoB, LpA, hsCRP,
+         Glucose, HbA1c, Leptin, Adiponectin, Insulin, 
+         HOMA_IR, Systolic_bp, Diastolic_bp, acetic, propionic, isobutyric,
+         butyric, LBP)
+
+# Col_host_data = left_join(Col_metadata_subset, Col_Func_Div, by = c("ID" = "sample")) %>% 
+#   left_join(Col_diet_qual, by = "ID")
+
+# Not using FD data
+Col_host_data = left_join(Col_metadata_subset, Col_diet_qual, by = "ID")
+
+Col_host_residuals_raw = Col_host_data %>% 
+  select(-ID) %>% 
+  map_dfr(., function(x) residuals_lm(x, lm_covariates))
+
+# Add names, bind and remove samples (cols) with NAs in data
+colnames(Col_host_residuals_raw) = Col_host_data$ID
+Col_host_residuals = bind_cols(host_var = colnames(Col_host_data)[-1], Col_host_residuals_raw) %>% 
+    select_if(~ !any(is.na(.)))
+
+Col_host_residuals %>% 
+  dfhead()
+
+# List of complete sample cases
+complete_samples = colnames(Col_host_residuals)[-1]
+```
+
+
+```{r}
+# Residuals of candidate module data
+Col_module_sig = Col_module_clr %>% 
+  select(Sample, one_of(Sig_modules_ID$feature))
+
+Col_module_residuals_raw = Col_module_sig %>% 
+  select(-Sample) %>% 
+  map_dfr(., function(x) residuals_lm(x, lm_covariates))
+
+colnames(Col_module_residuals_raw) = Col_module_sig$Sample
+Col_module_residuals = bind_cols(Module = colnames(Col_module_sig)[-1], Col_module_residuals_raw)
+
+Col_module_residuals = Col_module_residuals %>% 
+  select(Module, one_of(complete_samples))
+```
+
+
+```{r}
+Col_ortho_sig = Col_ortho_clr %>% 
+  select(Sample, one_of(Sig_ortho_ID$feature))
+
+# Residuals of candidate orthologs data
+Col_ortho_residuals_raw =  Col_ortho_sig %>% 
+  select(-Sample) %>% 
+  map_dfr(., function(x) residuals_lm(x, lm_covariates))
+
+colnames(Col_ortho_residuals_raw) = Col_ortho_sig$Sample
+Col_ortho_residuals = bind_cols(Ortholog = colnames(Col_ortho_sig)[-1], Col_ortho_residuals_raw)
+
+# Retain only samples with corresponding metadata
+Col_ortho_residuals = Col_ortho_residuals %>% 
+  select(Ortholog, one_of(complete_samples))
+
+# Print
+Col_module_residuals %>% dfhead()
+Col_ortho_residuals %>% dfhead()
+```
+
+## Write tables
+```{r}
+intermediate_dir = file.path(halla_dir, "tables")
+
+module_residuals_file = file.path(intermediate_dir, "Col_module_residuals.tsv")
+Col_module_residuals %>% 
+  rename("feat" = "Module") %>% 
+  write_tsv(module_residuals_file)
+  #write.table(x = ., file =  module_residuals_file, row.names = TRUE, quote = FALSE)
+
+ortho_residuals_file = file.path(intermediate_dir, "Col_ortho_residuals.tsv")
+Col_ortho_residuals %>% 
+  rename("feat" = "Ortholog") %>% 
+  write_tsv(ortho_residuals_file)
+
+host_residuals_file = file.path(intermediate_dir, "Col_host_residuals.tsv")
+Col_host_residuals %>% 
+  rename("feat" = "host_var") %>% 
+  write_tsv(host_residuals_file)
+```
+
+# Run Halla
+```{r}
+# output directories
+halla_out_mod = file.path(halla_dir, "out_mod")
+halla_out_ortho = file.path(halla_dir, "out_ortho")
+```
+
+## Modules
+```{r}
+# Create command to execute halla
+glue("conda activate {conda_env} && halla \\
+     --x_file {x_in} \\
+     --y_file {y_in} \\
+     --out_dir {out_dir} \\
+     --fdr_method {fdr_method} \\
+     --fdr_alpha {fdr} \\
+     --pdist_metric {metric} \\
+     --linkage_method {linkage} \\
+     --seed {seed}",
+     conda_env = conda_env, 
+     metric = "spearman",
+     linkage = "ward",
+     fdr_method = "fdr_bh",
+     fdr = 0.1,
+     seed = 2112, 
+     x_in = module_residuals_file, 
+     y_in = host_residuals_file, 
+     out_dir = halla_out_mod)
+```
+
+## Orthologs
+
+```{r}
+# Create command to execute halla
+glue("conda activate {conda_env} && halla \\
+     --x_file {x_in} \\
+     --y_file {y_in} \\
+     --out_dir {out_dir} \\
+     --fdr_method {fdr_method} \\
+     --fdr_alpha {fdr} \\
+     --pdist_metric {metric} \\
+     --linkage_method {linkage} \\
+     --seed {seed} \\
+     --no_hallagram",
+     conda_env = conda_env, 
+     metric = "spearman",
+     linkage = "ward",
+     fdr_method = "fdr_bh",
+     fdr = 0.1,
+     seed = 2112, 
+     x_in = ortho_residuals_file, 
+     y_in = host_residuals_file, 
+     out_dir = halla_out_ortho)
+```
+
+
+## Customize plot
+```{r}
+# Module clustermap from halla
+glue("conda activate {conda_env} && hallagram \\
+     --clustermap \\
+     --input {in_dir} \\
+     --x_dataset_label {x_lab} \\
+     --y_dataset_label {y_lab} \\
+     --cbar_label {col_lab} \\
+     --fdr_alpha {fdr} \\
+     --cmap {col_map} \\
+     --block_border_width {border} \\
+     --dpi {resolution} \\
+     --output {out_file} \\
+     --mask",
+     x_lab = '"Host parameters"', 
+     y_lab = '"KEGG modules"', 
+     col_lab = "rho",
+     fdr = 0.1, 
+     col_map = "PuOr_r", 
+     border = 2.5, 
+     resolution = 300,
+     in_dir = halla_out_mod,
+     out_file = file.path(halla_out_mod, "Module_Clustermap_Masked.svg"))
+```
+
+```{r}
+# Module clustermap from halla
+# No Mask
+glue("conda activate {conda_env} && hallagram \\
+     --clustermap \\
+     --input {in_dir} \\
+     --x_dataset_label {x_lab} \\
+     --y_dataset_label {y_lab} \\
+     --cbar_label {col_lab} \\
+     --fdr_alpha {fdr} \\
+     --cmap {col_map} \\
+     --block_border_width {border} \\
+     --dpi {resolution} \\
+     --output {out_file}",
+     x_lab = '"Host parameters"', 
+     y_lab = '"KEGG modules"', 
+     col_lab = "rho",
+     fdr = 0.1, 
+     col_map = "PuOr_r", 
+     border = 2.5, 
+     resolution = 300,
+     in_dir = halla_out_mod,
+     out_file = file.path(halla_out_mod, "Module_Clustermap.svg"))
+```
+
+
+# Load results
+```{r}
+# Function to read the output files from halla
+# Note that the linkage is in a pandas format, loading to be implemented
+read_halla = function(halla_outdir){
+  results = list(all_associations = read_tsv(file.path(halla_outdir, "all_associations.txt")), 
+                 sig_clusters = read_tsv(file.path(halla_outdir, "sig_clusters.txt")),
+                 #X_linkage = read_tsv(file.path(halla_outdir, "X_linkage.npy")),
+                 #X_linkage = read_tsv(file.path(halla_outdir, "Y_linkage.npy")),
+                 performance = read_lines(file.path(halla_outdir, "performance.txt")))
+  results
+}
+
+```
+
+```{r}
+# Modules
+mod_halla_results = read_halla(halla_out_mod)
+
+# Orthologs
+ortho_halla_results = read_halla(halla_out_ortho)
+```
+
+
+# Analyse results
+## Number of correlation blocks
+```{r}
+mod_halla_results$sig_clusters %>% 
+  nrow
+
+ortho_halla_results$sig_clusters %>% 
+  nrow
+```
+
+
+## Arrange tables and characterize largest associations
+```{r}
+mod_halla_results$all_associations
+mod_halla_results$sig_clusters %>% 
+  arrange(cluster_Y, best_adjusted_pvalue)
+```
+
+```{r}
+# Create long data frame with each module of cluster per row
+mod_halla_long = mod_halla_results$sig_clusters %>% 
+  mutate(cluster_size = str_count(cluster_X, "M")) %>% 
+  separate(cluster_X, into = str_c("Feat", 1:max(.$cluster_size)), sep = "\\;") %>% 
+  pivot_longer(values_to = "Module", cols = str_c("Feat", 1:max(.$cluster_size))) %>% 
+  select(-name, -cluster_size) %>% 
+  drop_na()
+
+# Add annotation of Module
+mod_halla_long = mod_halla_long %>%
+  left_join(Col_module_summ,  by = "Module") %>% 
+  select(cluster_rank, Module, Definition, cluster_Y, best_adjusted_pvalue)
+
+# Create long data frame with each ortholog of cluster per row
+ortho_halla_long = ortho_halla_results$sig_clusters %>% 
+  mutate(cluster_size = str_count(cluster_X, "K")) %>% 
+  separate(cluster_X, into = str_c("Feat", 1:max(.$cluster_size)), sep = "\\;") %>% 
+  pivot_longer(values_to = "Ortholog", cols = str_c("Feat", 1:max(.$cluster_size))) %>% 
+  select(-name, -cluster_size) %>% 
+  drop_na()
+
+# Add annotation of Ortholog
+ortho_halla_long = ortho_halla_long %>%
+  left_join(Col_ortho_summ,  by = "Ortholog") %>% 
+  select(cluster_rank, Ortholog, Description, cluster_Y, best_adjusted_pvalue)
+
+
+```
+
+## Features associated with SCFAs
+```{r}
+# Variables
+SCFAs = c("butyric", "acetic", "propionic", "isobutyric")
+
+```
+
+```{r}
+# Modules
+mod_halla_scfa = mod_halla_long %>% 
+  filter(str_detect(cluster_Y, paste0(SCFAs, collapse  = "|"))) 
+
+# Total clusters
+mod_halla_scfa %>% 
+  select(cluster_rank) %>% 
+  distinct() %>% 
+  nrow()
+
+# Distinct modules covered by said clusters
+mod_halla_scfa %>% 
+  select(Module) %>% 
+  distinct() %>% 
+  nrow()
+
+write_tsv(mod_halla_scfa, "/ebio/abt3_projects/columbian_gut_metagenome/tmp/mod_halla_scfa.tsv")
+```
+
+```{r}
+# Orthologs
+ortho_halla_scfa = ortho_halla_long %>% 
+  filter(str_detect(cluster_Y, paste0(SCFAs, collapse  = "|"))) 
+
+# Total clusters
+ortho_halla_scfa %>% 
+  select(cluster_rank) %>% 
+  distinct() %>% 
+  nrow()
+
+# Distinct orthologs covered by said clusters
+ortho_halla_scfa %>% 
+  select(Ortholog) %>% 
+  distinct() %>% 
+  nrow()
+```
+
+## Features associated with blood pressure
+```{r}
+# Variables
+Blood_pressure = c("Systolic_bp", "Diastolic_bp")
+```
+
+```{r}
+# Modules
+mod_halla_bp = mod_halla_long %>% 
+  filter(str_detect(cluster_Y, paste0(Blood_pressure, collapse  = "|"))) 
+
+# Total clusters
+mod_halla_bp %>% 
+  select(cluster_rank) %>% 
+  distinct() %>% 
+  nrow()
+
+# Distinct modules covered by said clusters
+mod_halla_bp %>% 
+  select(Module) %>% 
+  distinct() %>% 
+  nrow()
+
+write_tsv(mod_halla_bp, "/ebio/abt3_projects/columbian_gut_metagenome/tmp/mod_halla_bp.tsv")
+```
+
+```{r}
+# Orthologs
+ortho_halla_bp = ortho_halla_long %>% 
+  filter(str_detect(cluster_Y, paste0(Blood_pressure, collapse  = "|"))) 
+
+# Total clusters
+ortho_halla_bp %>% 
+  select(cluster_rank) %>% 
+  distinct() %>% 
+  nrow()
+
+# Distinct orthologs covered by said clusters
+ortho_halla_bp %>% 
+  select(Ortholog) %>% 
+  distinct() %>% 
+  nrow()
+```
+
+
+```{r}
+# Largest clusters associated with SCFA and BP
+# Positively
+Pos_SCFA_BP = mod_halla_long %>% 
+  filter(cluster_rank %in% c(1, 5, 12, 13)) 
+
+write_tsv(Pos_SCFA_BP, "/ebio/abt3_projects/columbian_gut_metagenome/tmp/Pos_SCFA_BP.tsv")
+
+# Negatively
+Neg_SCFA_BP = mod_halla_long %>% 
+  filter(cluster_rank %in% c(2, 4, 10)) 
+
+write_tsv(Neg_SCFA_BP, "/ebio/abt3_projects/columbian_gut_metagenome/tmp/Neg_SCFA_BP.tsv")
+```
+

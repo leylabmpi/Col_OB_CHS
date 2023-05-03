@@ -1,0 +1,339 @@
+---
+title: "KEGG stratified data"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta-Zuluaga. March 2021.
+
+The aim of this notebook is to prepare the stratified outputs of HUMANn2, KEGG orthologs and modules. I will transform the tables using the centered-log-ratio and filter the candidate orthologs and modules to then use for the analysis of the contribution of different taxa to the functional profile of the microbiome.
+
+# Init
+Load packages
+```{r}
+# General
+library(conflicted)
+
+# CODA
+library(propr)
+library(zCompositions)
+
+# Data manipulation
+library(glue)
+library(furrr)
+library(vegan)
+library(tidyverse)
+library(LeyLabRMisc)
+library(data.table)
+library(cowplot)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("between", "dplyr")
+conflict_prefer("first", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+redundancy_dir =  file.path(base_dir, "data/metagenome_profile/intermediate_files/Functional_redundancy")
+```
+
+Seed
+```{r}
+set.seed(1990)
+```
+
+Parallel
+```{r}
+# Increase size of globals max size to 2 Gb
+options(future.globals.maxSize= 2048*1024^2)
+```
+
+
+## Load tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+#nonpareil_table_file = file.path(base_dir, "/data/intermediate_files/2019_01_combined/nonpareil/2019_01_coverage.tsv")
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+# Colombian samples retained
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+   read_tsv()
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+```
+
+```{r}
+# Publicly available modules
+Col_module_summ = fread(file.path(base_dir,
+                                  "code/metagenome_profiles/R_notebooks/Tables/Candidate_Modules.tsv"), 
+                        data.table = FALSE)
+
+# KEGG modules in Colombian samples
+# RPK
+Col_module_rpk_strat = file.path(LLMGP_dir, "kegg_modules/kegg_modules_strat.tsv.gz") %>% 
+  fread(data.table = FALSE) %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+Col_module_rpk_strat %>% lhead()
+```
+
+# Calculate functional redundancy of modules
+```{r}
+# Function to calculate # taxa encoding a feature on a sample
+func_redund = function(feature, feat_table){
+  
+  feat_table %>% # Table of features
+  select(Sample, matches(feature)) %>% # Select feature to count 
+  pivot_longer(cols = -Sample) %>% 
+  separate(name, into = c("Module", "Taxon"), sep = "\\|") %>% 
+  mutate(value = if_else(value == 0, 0, 1)) %>% # convert PA of module by taxon
+  group_by(Sample, Module) %>% 
+  summarise(redundancy = sum(value)) %>% # Number of taxa contributing to feat in sample
+  ungroup()
+}
+```
+
+```{r}
+# Calculate redundancy per sample
+# Vector of modules to count
+candidate_vector = Col_module_summ$Module
+
+# N parallel jobs
+plan(multisession, workers = 16)
+
+# Execute function
+module_redundancy = future_map_dfr(candidate_vector, function(x) func_redund(x, Col_module_rpk_strat))
+send_email(body = "Done", subject = "func_redund is done")
+
+fwrite(x = module_redundancy, 
+       file = file.path(redundancy_dir, "Module_functional_redundancy.tsv.gz"), 
+       sep = "\t")
+```
+
+
+
+```{r}
+module_redundancy %>% 
+  arrange(Sample)
+```
+
+
+# Selection of central tendency measure for redundancy
+## Calculate skewness
+```{r}
+# Calculate skewness of redundancy within each sample
+# Use Pearson's coefficient of Skewness
+
+Col_Module_Sk = module_redundancy %>% 
+  group_by(Sample) %>% 
+  summarize(median_redund = median(redundancy), 
+            mean_redund = mean(redundancy), 
+            sd_redund = sd(redundancy)) %>% 
+  ungroup() %>% 
+  mutate(Sk = 3*((mean_redund - median_redund)/sd_redund)) %>% 
+  arrange(-Sk)
+
+# Sk = 0: No skew
+# Sk > 0: Positive (right) skew
+# Sk < 0: Negative (left) skew
+
+# Summarize skewness
+Col_Module_Sk %>% 
+  summarize(min = min(Sk), mean = mean(Sk), median = median(Sk), sd = sd(Sk), max = max(Sk)) %>% 
+  pivot_longer(cols = everything(), names_to = "Measure")
+
+# Histogram of skewness
+Col_Module_Sk %>% 
+  ggplot(aes(x = Sk)) +
+    geom_histogram(fill = "#A9A9A9", bins = nclass.FD(Col_Module_Sk$Sk)) +
+    theme_minimal() + NULL
+    # geom_vline(xintercept = 0, linetype = "dashed")
+```
+
+Since all samples have a positive redundancy distribution (Sk > 0), I will use the median redundancy as metric.
+
+## Calculate functional redundacy for each sample
+```{r}
+# Calculate median redundancy and add nonpareil sequence diversity to table
+Col_func_redund = module_redundancy %>% 
+  group_by(Sample) %>% 
+  summarize(median_redundancy = median(redundancy)) %>% 
+  left_join(nonpareil_table, by = "Sample") %>% 
+  group_by(Sample) %>% 
+  slice(1) %>% 
+  select(Sample, median_redundancy, diversity) %>% 
+  ungroup()
+
+Col_func_redund %>% dfhead()
+```
+
+## Sample functional redundancy summary statistics
+```{r fig.width=3, fig.height=6}
+Col_func_redund %>% 
+  summarize(median_redund = median(median_redundancy), 
+            mean_redund = mean(median_redundancy), 
+            sd_redund = sd(median_redundancy)) %>% 
+  pivot_longer(cols = everything(), names_to = "Measure")
+
+Col_func_redund %>% 
+  ggplot(aes(x = "", y = log10(median_redundancy))) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    #scale_y_continuous(trans='log10') +
+    #coord_cartesian(ylim = c(0, NA)) +
+    labs(x = "", y = "Log10(Sample functional redundancy)")
+  
+```
+
+
+
+### Correlation of functional redundancy with sequence diversity
+```{r fig.width=7, fig.height=5}
+Col_func_redund %>% 
+  ggplot(aes(x = diversity, y = log10(median_redundancy))) +
+    geom_point() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    theme_minimal() +
+    labs(x = "Sequence diversity", y = "log(Functional redundancy)")
+
+#cor.test(log(Col_func_redund$median_redundancy), Col_func_redund$diversity)
+```
+
+# Module Functional redundancy
+
+Instead of looking into how many different taxa are contributing to the functional profile of a given sample, as above, I can explore how redundant each module is. For this, I can calculate an index similar to the sample functional redundancy, where I obtain the median number of taxa encoding said function.
+
+```{r}
+# Calculate module functional redundancy index
+Mod_func_redund = module_redundancy %>% 
+  group_by(Module) %>% 
+  summarize(median_redundancy = median(redundancy)) %>% 
+  ungroup() %>% 
+  left_join(Col_module_summ, by = "Module") %>% 
+  select(Module, median_redundancy, g.mean, msd, Prevalence, Prevalence_group, Color)
+
+Mod_func_redund %>% arrange(median_redundancy)
+```
+## Plots
+```{r fig.width=3, fig.height=6}
+Mod_func_redund %>% 
+  summarize(median_redund = median(median_redundancy), 
+            mean_redund = mean(median_redundancy), 
+            sd_redund = sd(median_redundancy)) %>% 
+  pivot_longer(cols = everything(), names_to = "Measure")
+
+Mod_func_redund %>% 
+  ggplot(aes(x = "", y = log10(median_redundancy))) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    #coord_cartesian(ylim = c(0, NA)) +
+    #scale_y_continuous(trans='log10') +
+    labs(x = "", y = "Log10(Module functional redundancy)")
+```
+
+```{r fig.width=15, fig.height=5}
+mod_fr_mean = Mod_func_redund %>% 
+  ggplot(aes(x = g.mean, y = log10(median_redundancy), color = Prevalence_group)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    scale_color_manual(values = c("#EEE51CFF", "#35B779FF")) +
+    theme_minimal() +
+    labs(x = "Mean abundance", y = "log10(Functional redundancy)", color = "Prevalence group") +
+    coord_cartesian(ylim = c(0, NA)) 
+
+mod_fr_sd = Mod_func_redund %>% 
+  ggplot(aes(x = msd, y = log10(median_redundancy), color = Prevalence_group)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    scale_color_manual(values = c("#EEE51CFF", "#35B779FF")) +
+    theme_minimal() +
+    labs(x = "Standard deviation", y = "log10(Functional redundancy)") +
+    coord_cartesian(ylim = c(0, NA)) 
+
+mod_fr_prev = Mod_func_redund %>% 
+  mutate(Prevalence = Prevalence*100) %>% 
+  ggplot(aes(x = Prevalence, y = log10(median_redundancy), color = Prevalence_group)) +
+    geom_point() +
+    #geom_smooth(method='lm', se=F, color="grey50") +
+    scale_color_manual(values = c("#EEE51CFF", "#35B779FF")) +
+    theme_minimal() +
+    labs(x = "Prevalence (%)", y = "log10(Functional redundancy)") +
+    coord_cartesian(ylim = c(0, NA)) 
+
+ggpubr::ggarrange(mod_fr_mean, mod_fr_sd, mod_fr_prev, align = c("h"),
+                  ncol=3, common.legend = TRUE, legend="bottom")
+
+```
+
+# Write tables
+```{r}
+# Full redundancy table
+write_tsv(module_redundancy, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Full_Functional_Redundancy.tsv"))
+# Module Functional Redundancy
+write_tsv(Mod_func_redund, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Module_Functional_Redundancy.tsv"))
+# Sample Functional Redundancy
+write_tsv(Col_func_redund, 
+          file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables/Sample_Functional_Redundancy.tsv"))
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```

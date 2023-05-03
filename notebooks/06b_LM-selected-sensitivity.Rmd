@@ -1,0 +1,1430 @@
+---
+title: "Linear models"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. February 2021.
+
+The goal of this notebook is to fit linear models to dissentangle cardiometabolic disease and obesity associations with the functional profile of the gut metagenome of a sample of adult Colombians.
+
+**Note** that this notebook uses `R v.3.6.2` unlike the other notebooks in the analysis of the Colombian metagenome data, which use `R v.4.0.2`. This is due to issues I encountered while installing `Maaslin2` under `R v.4.0.2`.
+
+# Init
+Load packages
+```{r}
+# Misc
+library(LeyLabRMisc)
+library(conflicted)
+
+# Graphs
+library(cowplot)
+library(UpSetR)
+
+# Data manipulation
+library(glue)
+library(data.table)
+library(tidyverse)
+library(broom)
+#library(furrr)
+
+# Analyis
+library(vegan)
+library(Maaslin2)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+#LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2019_01_GTDB/humann2")
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+```
+
+Set seed
+```{r}
+set.seed(1990)
+#plan(multisession, workers = 2)
+```
+
+
+## Load tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+    fread(., data.table = F)
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+```
+
+Load the clr-transformed functional profile tables. Recall to calculate the clr-transform, I removed the unmapped and the unintegrated features which are technically but not biologically relevant. See CoDa-transformations notebook.
+```{r}
+# KEGG Modules
+## Summary
+Col_module_summ = fread(file.path(base_dir,
+                                      "code/metagenome_profiles/R_notebooks/Tables/Candidate_Modules.tsv"), 
+                                     data.table = FALSE)
+## clr-transformed data
+Col_module_clr = fread(file.path(logratios_dir, "Candidate_Modules_clr.tsv"), 
+                                   data.table = FALSE)
+
+## proportionality matrix
+Col_module_rho = fread(file.path(logratios_dir, "Candidate_Modules_rho.tsv"), 
+                                   data.table = FALSE)
+
+# KEGG Orthologs
+## Summary
+Col_ortho_summ = fread(file.path(base_dir,
+                                      "code/metagenome_profiles/R_notebooks/Tables/Candidate_Orthologs.tsv"), 
+                                    data.table = FALSE)
+## clr-transformed data
+Col_ortho_clr = fread(file.path(logratios_dir, "Candidate_Orthologs_clr.tsv"), 
+                                  data.table = FALSE)
+
+## proportionality matrix
+Col_ortho_rho = fread(file.path(logratios_dir, "Candidate_Orthologs_rho.tsv"), 
+                                  data.table = FALSE)
+# GOMixer annots
+Col_ortho_GMM = fread(file.path(base_dir,
+                                "code/metagenome_profiles/R_notebooks/Tables/Candidate_Orthologs_GMM.tsv"), 
+                                    data.table = FALSE)
+
+```
+
+# Linear models with Maaslin2
+
+I will use the Maaslin2 package to run linear models on the functional profile data while accounting for relevant co-variates.
+
+## Write Maaslin2 wrapper function
+
+Maaslin2 is a bit awkward to run, so I will create a wrapper function to make it work a bit better. Note that these are issues with version 1.0.0.
+
+* It only works when the input data is written on a file on disk, not directly from R. Because of that, I will make the wrapper function write the input tables to temporary files and executin the function. [See this issue](https://github.com/biobakery/Maaslin2/issues/1).
+
+* The filtering doesn't really work, so I have to manually filter the tables and then use those filtered as input. [See this issue](https://forum.biobakery.org/t/filtering-of-features-by-abundance/301)
+
+* The function is very verbose and there is no command to deactivate it, so I'm sending the output to a temporary log file.
+
+* Some of the presets are better turned off, so I will configure the defaults as I see fit.
+
+```{r}
+# Define function with new defaults
+maaslin_2 = function(input_data = input_data,
+                     input_metadata = input_metadata,
+                     output = "/tmp/global2/jdelacuesta/R",
+                     temp_dir = "/tmp/global2/jdelacuesta/R",
+                     qval = 0.1,
+                     min_abundance = -1,
+                     min_prevalence = 0,
+                     normalization = "NONE",
+                     transform = "NONE",
+                     analysis_method = "LM",
+                     max_significance = 0.25,
+                     random_effects = NULL,
+                     fixed_effects = NULL,
+                     correction = "BH",
+                     standardize = FALSE,
+                     cores = 1,
+                     plot_heatmap = FALSE,
+                     plot_scatter = FALSE,
+                     heatmap_first_n = 50) {
+  
+  # Write data frames to temporary files to execute Maaslin2
+  tmp_feature = tempfile(pattern = "feats_", tmpdir = "/ebio/abt3_projects/small_projects/jdelacuesta/tmp", fileext = ".txt")
+  write_delim(input_data, tmp_feature, delim = "\t")
+
+  tmp_metadata = tempfile(pattern = "metadata_", tmpdir = "/ebio/abt3_projects/small_projects/jdelacuesta/tmp", fileext = ".txt")
+  write_delim(input_metadata, tmp_metadata, delim = "\t")
+  
+  # Maaslin is very verbose
+  # There is no way of deactivating the log
+  # I'll sink it to a temporary file as well
+  tmplog = tempfile(pattern = "log_", tmpdir = "/ebio/abt3_projects/small_projects/jdelacuesta/tmp", fileext = ".txt")
+  #print(tmplog)
+  sink(tmplog)
+  
+  # Execute Maaslin2
+  maaslin_2_fit = Maaslin2::Maaslin2(input_data = tmp_feature, 
+                     input_metadata = tmp_metadata, 
+                     output = output, 
+                     min_abundance = min_abundance, 
+                     min_prevalence = min_prevalence, 
+                     normalization = normalization, 
+                     transform = transform, 
+                     analysis_method = analysis_method, 
+                     max_significance = max_significance, 
+                     random_effects = random_effects, 
+                     fixed_effects = fixed_effects, 
+                     correction = correction, 
+                     standardize = standardize, 
+                     cores = cores, 
+                     plot_heatmap = plot_heatmap, 
+                     plot_scatter = plot_scatter, 
+                     heatmap_first_n = heatmap_first_n)
+  # End log sink
+  sink() 
+  
+  # Filter the results table by qvalue threshold
+  maaslin_2_df = maaslin_2_fit$result
+  maaslin_2_df
+}
+
+# Function to easily run the wrapper and extract table with values
+run_maaslin_2 = function(Features, Metadata, Covariates, Explanatory, padj = 0.1, full_results = FALSE) {
+  # Execute maaslin_2 wrapper function
+  maaslin_result = maaslin_2(Features, 
+                             Metadata, 
+                             fixed_effects = c(Covariates, Explanatory))
+  if(full_results == TRUE){
+    maaslin_result %>% 
+  filter(qval <= padj)
+  } else {
+      # Filter result
+  maaslin_result %>% 
+  filter(qval <= padj, metadata == Explanatory)
+  }
+}
+```
+
+## Prepare data
+### Create data frame of metadata
+The target variable and the covariates should be in the same data frame.
+```{r}
+# Dataframe with appropriate covariates
+Col_metadata_full = Col_metadata %>% 
+  select(ID, City, Sex, Age,
+         BMI, BMI_status,
+         Waist_Circumference, Waist_Circumference_status, 
+         Fat_percentage, Fat_percentage_status,
+         bsp_class, chs_class, MS_score, ends_with("_med"))
+
+Col_metadata_full %>% dfhead()
+
+# Data frame for sensitivity analysis
+Col_metadata_sens = Col_metadata_full %>% 
+  filter(n_med == 0)
+```
+
+### Remove subjects consuming medication
+One option is to perform a sensitivity analysis where I remove all subjects consuming medications such as PPI, dyslipidemia, hypertension and diabetes
+```{r}
+Col_metadata_full = Col_metadata_full %>% 
+  filter(n_med == 0)
+
+Col_module_clr = Col_module_clr %>% 
+  filter(Sample %in% Col_metadata_full$ID)
+```
+
+## Run Maaslin2 on KEGG modules
+```{r}
+# Definition of modules
+module_annot = Col_module_summ %>% 
+  select(Module, Definition, g.mean, msd, Prevalence)
+```
+
+### No adjustment by CHS
+*Co-variates to adjust*: I will fit the linear models using design-controlled variables as covariates. 
+```{r}
+# Create a vector of the covariates I will use to adjust
+# The test variable will be added during the function call
+covariates_vector_ind = c("City", "Age", "Sex")
+```
+
+*Explanatory variables to test*
+```{r}
+explanatory_vector_ind = c("Fat_percentage_status", "Fat_percentage", "BMI", 
+                      "BMI_status", "Waist_Circumference", "Waist_Circumference_status",
+                      "bsp_class", "chs_class", "MS_score")
+```
+
+```{r}
+# Run Maaslin2 on all the explanatory variables and save in list
+full_all_noadj = map(explanatory_vector_ind, 
+    function(expl) run_maaslin_2(Col_module_clr, Col_metadata_full, covariates_vector_ind, expl))
+
+names(full_all_noadj) = explanatory_vector_ind
+```
+
+### Adjusting by CHS
+
+*Co-variates to adjust*: In addition to the already used variables, I will include the CHS as covariate to adjust the models
+```{r}
+# Create a vector of the covariates I will use to adjust
+# The test variable will be added during the function call
+covariates_vector_adj = c("City", "Age", "Sex", "chs_class")
+```
+
+*Explanatory variables to test* remove the CHS status from the vector of variables since it is now included in the covariate vector.
+```{r}
+explanatory_vector_adj = c("Fat_percentage_status", "Fat_percentage", "BMI", 
+                           "BMI_status", "Waist_Circumference", "Waist_Circumference_status",
+                           "bsp_class", "MS_score")
+```
+
+```{r}
+# Run Maaslin2 on all the explanatory variables and save in list
+full_all_adj = map(explanatory_vector_adj, 
+    function(expl) run_maaslin_2(Col_module_clr, Col_metadata_full, covariates_vector_adj, expl, full_results = TRUE))
+
+names(full_all_adj) = explanatory_vector_adj
+```
+
+
+### BMI as explanatory variable
+Shared features are those whose association with a given host parameter disappears once adjusted for a second host parameter; shared features do not necessarily have significant associations with both host parameters. On the other hand, unique features are those whose association with a parameter remains even after accounting for the second one.
+```{r}
+# Distinct significant modules associated with BMI
+BMI_mod = full_all_noadj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with CHS
+CHS_mod = full_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with BMI adj for CHS
+# i.e. unique
+adj_BMI_mod = full_all_adj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "BMI")
+
+# Distinct significant modules associated with CHS adj for BMI
+# i.e. unique
+adj_bmiCHS_mod = full_all_adj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All modules associated with CHS and BMI. Tangled association
+pool_BMI_CHS_mod = bind_rows(BMI_mod, CHS_mod, adj_BMI_mod, adj_bmiCHS_mod)
+
+# Core associations
+# Modules associated with BMI confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_BMI_mod = anti_join(BMI_mod, adj_BMI_mod, by = c("feature"))
+
+# Pathways associated with CHS confounded by BMI
+# i.e present with no adjust, absent with adjust
+confound_CHS_mod = anti_join(CHS_mod, adj_bmiCHS_mod, by = c("feature"))
+
+# All pathways confounded by BMI or CHS
+core_BMI_CHS_mod = pool_BMI_CHS_mod %>% #bind_rows(confound_BMI_mod, confound_CHS_mod) %>% 
+  filter(!(feature %in% adj_BMI_mod$feature), !(feature %in% adj_bmiCHS_mod$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive BMI coef sign -> positive corr with BMI
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_BMI_CHS_mod %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_BMI_CHS_mod %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Single table of significant modules count
+```{r}
+# Number of modules in each of the categories
+# List of result tables
+BMI_CHS_modules_list = list(pool_BMI_CHS_mod, BMI_mod, 
+                            CHS_mod, adj_BMI_mod, 
+                            adj_bmiCHS_mod, core_BMI_CHS_mod)
+
+names(BMI_CHS_modules_list) = c("pool_BMI_CHS_mod", "BMI_mod",
+                                "CHS_mod", "adj_BMI_mod",
+                                "adj_bmiCHS_mod", "core_BMI_CHS_mod")
+
+# Create single table with numbers
+BMI_CHS_modules_n = map(BMI_CHS_modules_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+BMI_CHS_modules_n = BMI_CHS_modules_n %>% 
+  unlist %>% 
+  data.frame(Set = names(BMI_CHS_modules_list), n_modules = .)
+
+BMI_CHS_modules_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared modules for each condition
+uniq_BMI_mod_annot = adj_BMI_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_bmiCHS_mod_annot = adj_bmiCHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+BMI_CHS_mod_annot = core_BMI_CHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+```{r}
+# Wrirte tables
+# write_tsv(uniq_BMI_mod_annot, file.path(tab_dir, "uniq_BMI_mod_annot.tsv"))
+# write_tsv(uniq_bmiCHS_mod_annot, file.path(tab_dir, "uniq_bmiCHS_mod_annot.tsv"))
+# write_tsv(BMI_CHS_mod_annot, file.path(tab_dir, "BMI_CHS_mod_annot.tsv"))
+```
+
+Summarize the abundance, prevalence and dispersion of the significant modules
+```{r}
+# Core modules
+BMI_CHS_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = mean(Prevalence)) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+# Unique for CHS
+uniq_bmiCHS_mod_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = mean(Prevalence)) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+# Unique for BMI
+uniq_BMI_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = mean(Prevalence)) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+```
+
+```{r fig.height=9, fig.width=8}
+# Plot differences in abundance/prevalence
+
+uniq_BMI_ab_bxplt = uniq_BMI_mod_annot %>% 
+  ggplot(aes(x = quick_assoc, y = g.mean)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    labs(x = "", y = "mean(clr-transformed abundance)") 
+
+uniq_BMI_pr_bxplt = uniq_BMI_mod_annot %>%
+  mutate(Prevalence = Prevalence *100) %>% 
+  ggplot(aes(x = quick_assoc, y = Prevalence)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    labs(x = "", y = "Prevalence (%)") 
+
+BMI_CHS_ab_bxplt = BMI_CHS_mod_annot %>% 
+  ggplot(aes(x = quick_assoc, y = g.mean)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    labs(x = "", y = "mean(clr-transformed abundance)") 
+
+BMI_CHS_pr_bxplt = BMI_CHS_mod_annot %>% 
+  mutate(Prevalence = Prevalence *100) %>% 
+  ggplot(aes(x = quick_assoc, y = Prevalence)) +
+    geom_jitter(position=position_jitter(0.1), alpha = 0.75, color="grey50") +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult = 1), geom="pointrange", color="black", size = 0.75) +
+    theme_minimal() +
+    labs(x = "", y = "Prevalence (%)") 
+
+uniq_BMI_bxplts = plot_grid(uniq_BMI_ab_bxplt, uniq_BMI_pr_bxplt, align = "h", nrow = 1)
+BMI_CHS_bxplts = plot_grid(BMI_CHS_ab_bxplt, BMI_CHS_pr_bxplt, align = "h", nrow = 1)
+BMI_pr_ab_bxplots = plot_grid(BMI_CHS_bxplts, uniq_BMI_bxplts, align = "v", nrow = 2, labels = "AUTO")
+# save_plot(file.path(fig_dir, "BMI_pr_ab_bxplots.png"), BMI_pr_ab_bxplots, 
+#           base_width = 8, base_height = 9)
+
+```
+
+
+
+Are the disease-associated modules more or less abundant than the health associated ones?
+*example* with modules unique to obesity
+```{r}
+# Test mean abundance, standard deviation and prevalence
+wilcox.test(g.mean ~ factor(quick_assoc), data = uniq_BMI_mod_annot, exact = FALSE)
+wilcox.test(msd ~ factor(quick_assoc), data = uniq_BMI_mod_annot, exact = FALSE)
+wilcox.test(Prevalence ~ factor(quick_assoc), data = uniq_BMI_mod_annot, exact = FALSE)
+```
+
+# Waist circumference as explanatory variable
+```{r}
+# Distinct significant modules associated with WC
+WC_mod = full_all_noadj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with CHS
+wcCHS_mod = full_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with WC adj for CHS
+# i.e. unique
+adj_WC_mod = full_all_adj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "Waist_Circumference")
+
+# Distinct significant modules associated with CHS adj for WC
+# i.e. unique
+adj_wcCHS_mod = full_all_adj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All modules associated with CHS and WC. Tangled association
+pool_WC_wcCHS_mod = bind_rows(WC_mod, CHS_mod, adj_WC_mod, adj_wcCHS_mod)
+
+# Core associations
+# Modules associated with WC confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_WC_mod = anti_join(WC_mod, adj_WC_mod, by = c("feature"))
+
+# Pathways associated with CHS confounded by WC
+# i.e present with no adjust, absent with adjust
+confound_wcCHS_mod = anti_join(wcCHS_mod, adj_wcCHS_mod, by = c("feature"))
+
+# All pathways confounded by WC or CHS
+core_WC_wcCHS_mod = pool_WC_wcCHS_mod %>% #bind_rows(confound_WC_mod, confound_wcCHS_mod) %>% 
+  filter(!(feature %in% adj_WC_mod$feature), !(feature %in% adj_wcCHS_mod$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive WC coef sign -> positive corr with WC
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_WC_wcCHS_mod %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_WC_wcCHS_mod %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Count of significant modules in a single table
+```{r}
+# Number of modules in each of the categories
+# List of result tables
+WC_wcCHS_modules_list = list(pool_WC_wcCHS_mod, WC_mod, 
+                            CHS_mod, adj_WC_mod, 
+                            adj_wcCHS_mod, core_WC_wcCHS_mod)
+
+names(WC_wcCHS_modules_list) = c("pool_WC_wcCHS_mod", "WC_mod",
+                                "wcCHS_mod", "adj_WC_mod",
+                                "adj_wcCHS_mod", "core_WC_wcCHS_mod")
+
+# Create single table with numbers
+WC_wcCHS_modules_n = map(WC_wcCHS_modules_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+WC_wcCHS_modules_n = WC_wcCHS_modules_n %>% 
+  unlist %>% 
+  data.frame(Set = names(WC_wcCHS_modules_list), n_modules = .)
+
+WC_wcCHS_modules_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared modules for each condition
+uniq_WC_mod_annot = adj_WC_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_wcCHS_mod_annot = adj_wcCHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+WC_CHS_mod_annot = core_WC_wcCHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+Summarize the abundance, prevalence and dispersion of the significant modules
+```{r}
+# Core modules
+WC_CHS_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for CHS
+uniq_wcCHS_mod_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for WC
+uniq_WC_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+```
+
+
+### Percentage body fat as explanatory variable
+
+```{r}
+# Distinct significant modules associated with BF
+BF_mod = full_all_noadj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with CHS
+bfCHS_mod = full_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant modules associated with BF adj for CHS
+# i.e. unique
+adj_BF_mod = full_all_adj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "Fat_percentage")
+
+# Distinct significant modules associated with CHS adj for BF
+# i.e. unique
+adj_bfCHS_mod = full_all_adj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All modules associated with CHS and BF. Tangled association
+pool_BF_bfCHS_mod = bind_rows(BF_mod, CHS_mod, adj_BF_mod, adj_bfCHS_mod)
+
+# Core associations
+# Modules associated with BF confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_BF_mod = anti_join(BF_mod, adj_BF_mod, by = c("feature"))
+
+# Pathways associated with CHS confounded by BF
+# i.e present with no adjust, absent with adjust
+confound_bfCHS_mod = anti_join(bfCHS_mod, adj_bfCHS_mod, by = c("feature"))
+
+# All pathways confounded by BF or CHS
+core_BF_bfCHS_mod = pool_BF_bfCHS_mod %>% #bind_rows(confound_BF_mod, confound_bfCHS_mod) %>% 
+  filter(!(feature %in% adj_BF_mod$feature), !(feature %in% adj_bfCHS_mod$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive BF coef sign -> positive corr with BF
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_BF_bfCHS_mod %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_BF_bfCHS_mod %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Counts of significant modules per test
+```{r}
+# Number of modules in each of the categories
+# List of result tables
+BF_bfCHS_modules_list = list(pool_BF_bfCHS_mod, BF_mod, 
+                            CHS_mod, adj_BF_mod, 
+                            adj_bfCHS_mod, core_BF_bfCHS_mod)
+
+names(BF_bfCHS_modules_list) = c("pool_BF_bfCHS_mod", "BF_mod",
+                                "bfCHS_mod", "adj_BF_mod",
+                                "adj_bfCHS_mod", "core_BF_bfCHS_mod")
+
+# Create single table with numbers
+BF_bfCHS_modules_n = map(BF_bfCHS_modules_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+BF_bfCHS_modules_n = BF_bfCHS_modules_n %>% 
+  unlist %>% 
+  data.frame(Set = names(BF_bfCHS_modules_list), n_modules = .)
+
+BF_bfCHS_modules_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared modules for each condition
+uniq_BF_mod_annot = adj_BF_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_bfCHS_mod_annot = adj_bfCHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+BF_CHS_mod_annot = core_BF_bfCHS_mod %>% 
+  left_join(module_annot, by = c("feature" = "Module")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+Summarize the abundance, prevalence and dispersion of the significant modules
+```{r}
+# Core modules
+BF_CHS_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for CHS
+uniq_bfCHS_mod_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for BF
+uniq_BF_mod_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+```
+
+## Combine results of obesity measures
+```{r}
+# Core associations
+BMI_CHS_mod_annot
+WC_CHS_mod_annot
+BF_CHS_mod_annot
+
+# Unique to each obesity measure adj by CHS
+uniq_BMI_mod_annot
+uniq_WC_mod_annot
+uniq_BF_mod_annot
+
+
+# Unique to CHS adj by each obesity measure
+uniq_bmiCHS_mod_annot
+uniq_wcCHS_mod_annot
+uniq_bfCHS_mod_annot
+
+```
+
+# Combine Module results
+```{r}
+# Unique to each obesity measure adj by CHS
+bind_ob_uniq = bind_rows(uniq_BMI_mod_annot, uniq_WC_mod_annot, uniq_BF_mod_annot)
+  #select(feature, annot, quick_assoc, metadata)
+
+bind_ob_uniq %>% 
+  add_count(feature) %>% 
+  arrange(quick_assoc, feature, metadata)
+```
+
+```{r}
+# Unique to CHS adj by each obesity measure
+bind_chs_uniq = bind_rows(mutate(uniq_bmiCHS_mod_annot, adj = "BMI"), 
+                   mutate(uniq_wcCHS_mod_annot, adj = "Waist_Circumference"),
+                   mutate(uniq_bfCHS_mod_annot, adj = "Fat_percentage"))
+  #select(feature, annot, quick_assoc, metadata, adj)
+
+
+bind_chs_uniq %>% 
+  count(feature, sort = TRUE)
+
+bind_chs_uniq %>% 
+  arrange(feature, adj)
+```
+
+```{r}
+bind_core = bind_rows(mutate(BMI_CHS_mod_annot, adj = "BMI"), 
+                   mutate(WC_CHS_mod_annot, adj = "Waist_Circumference"),
+                   mutate(BF_CHS_mod_annot, adj = "Fat_percentage")) %>% 
+  #select(feature, annot, quick_assoc, metadata, adj, value) %>% 
+  group_by(adj, feature) %>% 
+  slice(1) %>% 
+  ungroup()
+  
+
+
+bind_core %>% 
+  count(feature, sort = TRUE)
+
+bind_core %>% 
+  arrange(feature, metadata)
+```
+
+## Write Module tables
+```{r}
+bind_ob_uniq %>% 
+  write_tsv(., file.path(tab_dir, "ob_uniq_mod_sens.tsv"))
+bind_chs_uniq %>% 
+  write_tsv(., file.path(tab_dir, "chs_uniq_mod_sens.tsv"))
+bind_core %>% 
+  write_tsv(., file.path(tab_dir, "core_mod_sens.tsv"))
+```
+
+## Run Maaslin2 on KEGG orthologs
+```{r}
+# Definition of ortho
+ortho_annot = Col_ortho_summ %>% 
+  select(Ortholog, Definition = Description, g.mean, msd, Prevalence)
+```
+
+### No adjustment by CHS
+*Co-variates to adjust*: I will fit the linear models using design-controlled variables as covariates. 
+```{r}
+# Create a vector of the covariates I will use to adjust
+# The test variable will be added during the function call
+covariates_vector_ind = c("City", "Age", "Sex")
+```
+
+*Explanatory variables to test*
+```{r}
+explanatory_vector_ind = c("Fat_percentage_status", "Fat_percentage", "BMI", 
+                      "BMI_status", "Waist_Circumference", "Waist_Circumference_status",
+                      "bsp_class", "chs_class", "MS_score")
+```
+
+```{r}
+# Run Maaslin2 on all the explanatory variables and save in list
+full_ortho_all_noadj = map(explanatory_vector_ind, 
+    function(expl) run_maaslin_2(Col_ortho_clr, Col_metadata_full, covariates_vector_ind, expl))
+
+names(full_ortho_all_noadj) = explanatory_vector_ind
+```
+
+### Adjusting by CHS
+
+*Co-variates to adjust*: In addition to the already used variables, I will include the CHS as covariate to adjust the models
+```{r}
+# Create a vector of the covariates I will use to adjust
+# The test variable will be added during the function call
+covariates_vector_adj = c("City", "Age", "Sex", "chs_class")
+```
+
+*Explanatory variables to test* remove the CHS status from the vector of variables since it is now included in the covariate vector.
+```{r}
+explanatory_vector_adj = c("Fat_percentage_status", "Fat_percentage", "BMI", 
+                           "BMI_status", "Waist_Circumference", "Waist_Circumference_status",
+                           "bsp_class", "MS_score")
+```
+
+```{r}
+# Run Maaslin2 on all the explanatory variables and save in list
+full_ortho_all_adj = map(explanatory_vector_adj, 
+    function(expl) run_maaslin_2(Col_ortho_clr, Col_metadata_full, covariates_vector_adj, expl, full_results = TRUE))
+
+names(full_ortho_all_adj) = explanatory_vector_adj
+```
+
+### BMI as explanatory variable
+Shared features are those whose association with a given host parameter disappears once adjusted for a second host parameter; shared features do not necessarily have significant associations with both host parameters. On the other hand, unique features are those whose association with a parameter remains even after accounting for the second one.
+```{r}
+# Distinct significant ortho associated with BMI
+BMI_ortho = full_ortho_all_noadj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with CHS
+CHS_ortho = full_ortho_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with BMI adj for CHS
+# i.e. unique
+adj_BMI_ortho = full_ortho_all_adj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "BMI")
+
+# Distinct significant ortho associated with CHS adj for BMI
+# i.e. unique
+adj_bmiCHS_ortho = full_ortho_all_adj %>% 
+  pluck("BMI") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All ortho associated with CHS and BMI. Tangled association
+pool_BMI_CHS_ortho = bind_rows(BMI_ortho, CHS_ortho, adj_BMI_ortho, adj_bmiCHS_ortho)
+
+# Core associations
+# Modules associated with BMI confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_BMI_ortho = anti_join(BMI_ortho, adj_BMI_ortho, by = c("feature"))
+
+# Pathways associated with CHS confounded by BMI
+# i.e present with no adjust, absent with adjust
+confound_CHS_ortho = anti_join(CHS_ortho, adj_bmiCHS_ortho, by = c("feature"))
+
+# All pathways confounded by BMI or CHS
+core_BMI_CHS_ortho = pool_BMI_CHS_ortho %>% #bind_rows(confound_BMI_ortho, confound_CHS_ortho) %>% 
+  filter(!(feature %in% adj_BMI_ortho$feature), !(feature %in% adj_bmiCHS_ortho$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive BMI coef sign -> positive corr with BMI
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_BMI_CHS_ortho %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_BMI_CHS_ortho %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Single table of significant ortho count
+```{r}
+# Number of ortho in each of the categories
+# List of result tables
+BMI_CHS_ortho_list = list(pool_BMI_CHS_ortho, BMI_ortho, 
+                            CHS_ortho, adj_BMI_ortho, 
+                            adj_bmiCHS_ortho, core_BMI_CHS_ortho)
+
+names(BMI_CHS_ortho_list) = c("pool_BMI_CHS_ortho", "BMI_ortho",
+                                "CHS_ortho", "adj_BMI_ortho",
+                                "adj_bmiCHS_ortho", "core_BMI_CHS_ortho")
+
+# Create single table with numbers
+BMI_CHS_ortho_n = map(BMI_CHS_ortho_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+BMI_CHS_ortho_n = BMI_CHS_ortho_n %>% 
+  unlist %>% 
+  data.frame(Set = names(BMI_CHS_ortho_list), n_ortho = .)
+
+BMI_CHS_ortho_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared ortho for each condition
+uniq_BMI_ortho_annot = adj_BMI_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_bmiCHS_ortho_annot = adj_bmiCHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+BMI_CHS_ortho_annot = core_BMI_CHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "BMI" & coef > 0 ~ "Disease", 
+                                 metadata == "BMI" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+Summarize the abundance, prevalence and dispersion of the significant ortho
+```{r}
+# Core ortho
+BMI_CHS_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for CHS
+uniq_bmiCHS_ortho_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for BMI
+uniq_BMI_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+```
+
+Are the disease-associated ortho more or less abundant than the health associated ones?
+```{r}
+# Test mean abundance, standard deviation and prevalence
+wilcox.test(g.mean ~ factor(quick_assoc), data = BMI_CHS_ortho_annot, exact = FALSE)
+wilcox.test(msd ~ factor(quick_assoc), data = uniq_bmiCHS_ortho_annot, exact = FALSE)
+wilcox.test(Prevalence ~ factor(quick_assoc), data = uniq_BMI_ortho_annot, exact = FALSE)
+```
+
+### WC as explanatory variable
+Shared features are those whose association with a given host parameter disappears once adjusted for a second host parameter; shared features do not necessarily have significant associations with both host parameters. On the other hand, unique features are those whose association with a parameter remains even after accounting for the second one.
+```{r}
+# Distinct significant ortho associated with WC
+WC_ortho = full_ortho_all_noadj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with CHS
+CHS_ortho = full_ortho_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with WC adj for CHS
+# i.e. unique
+adj_WC_ortho = full_ortho_all_adj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "Waist_Circumference")
+
+# Distinct significant ortho associated with CHS adj for WC
+# i.e. unique
+adj_wcCHS_ortho = full_ortho_all_adj %>% 
+  pluck("Waist_Circumference") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All ortho associated with CHS and WC. Tangled association
+pool_WC_CHS_ortho = bind_rows(WC_ortho, CHS_ortho, adj_WC_ortho, adj_wcCHS_ortho)
+
+# Core associations
+# Modules associated with WC confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_WC_ortho = anti_join(WC_ortho, adj_WC_ortho, by = c("feature"))
+
+# Pathways associated with CHS confounded by WC
+# i.e present with no adjust, absent with adjust
+confound_CHS_ortho = anti_join(CHS_ortho, adj_wcCHS_ortho, by = c("feature"))
+
+# All pathways confounded by WC or CHS
+core_WC_CHS_ortho = pool_WC_CHS_ortho %>% #bind_rows(confound_WC_ortho, confound_CHS_ortho) %>% 
+  filter(!(feature %in% adj_WC_ortho$feature), !(feature %in% adj_wcCHS_ortho$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive WC coef sign -> positive corr with WC
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_WC_CHS_ortho %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_WC_CHS_ortho %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Single table of significant ortho count
+```{r}
+# Number of ortho in each of the categories
+# List of result tables
+WC_CHS_ortho_list = list(pool_WC_CHS_ortho, WC_ortho, 
+                            CHS_ortho, adj_WC_ortho, 
+                            adj_wcCHS_ortho, core_WC_CHS_ortho)
+
+names(WC_CHS_ortho_list) = c("pool_WC_CHS_ortho", "WC_ortho",
+                                "CHS_ortho", "adj_WC_ortho",
+                                "adj_wcCHS_ortho", "core_WC_CHS_ortho")
+
+# Create single table with numbers
+WC_CHS_ortho_n = map(WC_CHS_ortho_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+WC_CHS_ortho_n = WC_CHS_ortho_n %>% 
+  unlist %>% 
+  data.frame(Set = names(WC_CHS_ortho_list), n_ortho = .)
+
+WC_CHS_ortho_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared ortho for each condition
+uniq_WC_ortho_annot = adj_WC_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_wcCHS_ortho_annot = adj_wcCHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+WC_CHS_ortho_annot = core_WC_CHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Waist_Circumference" & coef > 0 ~ "Disease", 
+                                 metadata == "Waist_Circumference" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+Summarize the abundance, prevalence and dispersion of the significant ortho
+```{r}
+# Core ortho
+WC_CHS_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for CHS
+uniq_wcCHS_ortho_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for WC
+uniq_WC_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+```
+
+Are the disease-associated ortho more or less abundant than the health associated ones?
+```{r}
+# Test mean abundance, standard deviation and prevalence
+wilcox.test(g.mean ~ factor(quick_assoc), data = WC_CHS_ortho_annot, exact = FALSE)
+wilcox.test(msd ~ factor(quick_assoc), data = uniq_wcCHS_ortho_annot, exact = FALSE)
+wilcox.test(Prevalence ~ factor(quick_assoc), data = uniq_WC_ortho_annot, exact = FALSE)
+```
+
+### BF as explanatory variable
+Shared features are those whose association with a given host parameter disappears once adjusted for a second host parameter; shared features do not necessarily have significant associations with both host parameters. On the other hand, unique features are those whose association with a parameter remains even after accounting for the second one.
+```{r}
+# Distinct significant ortho associated with BF
+BF_ortho = full_ortho_all_noadj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with CHS
+CHS_ortho = full_ortho_all_noadj %>% 
+  pluck("chs_class") %>% 
+  select(feature, metadata, value, coef, pval, qval)
+
+# Distinct significant ortho associated with BF adj for CHS
+# i.e. unique
+adj_BF_ortho = full_ortho_all_adj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "Fat_percentage")
+
+# Distinct significant ortho associated with CHS adj for BF
+# i.e. unique
+adj_bfCHS_ortho = full_ortho_all_adj %>% 
+  pluck("Fat_percentage") %>% 
+  select(feature, metadata, value, coef, pval, qval) %>% 
+  filter(metadata == "chs_class")
+
+# All ortho associated with CHS and BF. Tangled association
+pool_BF_CHS_ortho = bind_rows(BF_ortho, CHS_ortho, adj_BF_ortho, adj_bfCHS_ortho)
+
+# Core associations
+# Modules associated with BF confounded by CHS
+# i.e present with no adjust, absent with adjust
+confound_BF_ortho = anti_join(BF_ortho, adj_BF_ortho, by = c("feature"))
+
+# Pathways associated with CHS confounded by BF
+# i.e present with no adjust, absent with adjust
+confound_CHS_ortho = anti_join(CHS_ortho, adj_bfCHS_ortho, by = c("feature"))
+
+# All pathways confounded by BF or CHS
+core_BF_CHS_ortho = pool_BF_CHS_ortho %>% #bind_rows(confound_BF_ortho, confound_CHS_ortho) %>% 
+  filter(!(feature %in% adj_BF_ortho$feature), !(feature %in% adj_bfCHS_ortho$feature))
+```
+
+Make sure that those that appear more than once have the same direction
+```{r}
+# positive BF coef sign -> positive corr with BF
+# Positive CHS coef sign -> Enriched in healthy subjects/depleted in unhealthy
+confounded_twice = core_BF_CHS_ortho %>% 
+  count(feature, sort = TRUE) %>% 
+  filter(n == 2) %>% 
+  pull(feature)
+
+coef_confounded_twice = core_BF_CHS_ortho %>% 
+  filter(feature %in% confounded_twice) %>% 
+  arrange(feature)
+```
+
+Single table of significant ortho count
+```{r}
+# Number of ortho in each of the categories
+# List of result tables
+BF_CHS_ortho_list = list(pool_BF_CHS_ortho, BF_ortho, 
+                            CHS_ortho, adj_BF_ortho, 
+                            adj_bfCHS_ortho, core_BF_CHS_ortho)
+
+names(BF_CHS_ortho_list) = c("pool_BF_CHS_ortho", "BF_ortho",
+                                "CHS_ortho", "adj_BF_ortho",
+                                "adj_bfCHS_ortho", "core_BF_CHS_ortho")
+
+# Create single table with numbers
+BF_CHS_ortho_n = map(BF_CHS_ortho_list, function(x){
+  x %>% 
+    select(feature) %>% 
+    distinct() %>% 
+    nrow()
+})
+
+BF_CHS_ortho_n = BF_CHS_ortho_n %>% 
+  unlist %>% 
+  data.frame(Set = names(BF_CHS_ortho_list), n_ortho = .)
+
+BF_CHS_ortho_n
+```
+
+Add variable of health association to core and unique tables
+```{r}
+# Tables with annotation of unique and shared ortho for each condition
+uniq_BF_ortho_annot = adj_BF_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+
+uniq_bfCHS_ortho_annot = adj_bfCHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+
+BF_CHS_ortho_annot = core_BF_CHS_ortho %>% 
+  left_join(ortho_annot, by = c("feature" = "Ortholog")) %>% 
+  mutate(quick_assoc = case_when(metadata == "Fat_percentage" & coef > 0 ~ "Disease", 
+                                 metadata == "Fat_percentage" & coef < 0 ~ "Health",
+                                 metadata == "chs_class" & coef > 0 ~ "Health", 
+                                 metadata == "chs_class" & coef < 0 ~ "Disease")) %>% 
+  select(feature, annot = Definition, quick_assoc, everything()) %>% 
+  arrange(quick_assoc)
+```
+
+Summarize the abundance, prevalence and dispersion of the significant ortho
+```{r}
+# Core ortho
+BF_CHS_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for CHS
+uniq_bfCHS_ortho_annot %>%
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+
+# Unique for BF
+uniq_BF_ortho_annot %>% 
+  select(feature, annot, quick_assoc, g.mean, msd, Prevalence) %>% 
+  distinct() %>% 
+  group_by(quick_assoc) %>% 
+  summarise(mean_mean = mean(g.mean), mean_sd = mean(msd), mean_prev = median(Prevalence))
+```
+
+Are the disease-associated ortho more or less abundant than the health associated ones?
+```{r}
+# Test mean abundance, standard deviation and prevalence
+wilcox.test(g.mean ~ factor(quick_assoc), data = BF_CHS_ortho_annot, exact = FALSE)
+wilcox.test(msd ~ factor(quick_assoc), data = uniq_bfCHS_ortho_annot, exact = FALSE)
+wilcox.test(Prevalence ~ factor(quick_assoc), data = uniq_BF_ortho_annot, exact = FALSE)
+```
+
+
+# Combine Ortholog results
+```{r}
+# Unique to each obesity measure adj by CHS
+bind_ob_uniq_ortho = bind_rows(uniq_BMI_ortho_annot, uniq_WC_ortho_annot, uniq_BF_ortho_annot) 
+  #select(feature, annot, quick_assoc, metadata)
+
+bind_ob_uniq_ortho %>% 
+  arrange(quick_assoc, feature, metadata)
+```
+
+```{r}
+# Unique to CHS adj by each obesity measure
+bind_chs_uniq_ortho = bind_rows(mutate(uniq_bmiCHS_ortho_annot, adj = "BMI"), 
+                   mutate(uniq_wcCHS_ortho_annot, adj = "Waist_Circumference"),
+                   mutate(uniq_bfCHS_ortho_annot, adj = "Fat_percentage")) 
+  # select(feature, annot, quick_assoc, metadata, adj)
+
+bind_chs_uniq_ortho %>% 
+  arrange(quick_assoc, feature, metadata)
+```
+
+```{r}
+bind_core_ortho = bind_rows(mutate(BMI_CHS_ortho_annot, adj = "BMI"), 
+                   mutate(WC_CHS_ortho_annot, adj = "Waist_Circumference"),
+                   mutate(BF_CHS_ortho_annot, adj = "Fat_percentage")) %>% 
+  #select(feature, annot, quick_assoc, metadata, adj, value) %>% 
+  group_by(adj, feature) %>% 
+  slice(1) %>% 
+  ungroup() 
+
+
+bind_core_ortho %>% 
+  arrange(quick_assoc, feature, metadata)
+```
+
+## Write Module tables
+```{r}
+bind_ob_uniq_ortho %>% 
+  write_tsv(., file.path(tab_dir, "ob_uniq_ortho_sens.tsv"))
+bind_chs_uniq_ortho %>% 
+  write_tsv(., file.path(tab_dir, "chs_uniq_ortho_sens.tsv"))
+bind_core_ortho %>% 
+  write_tsv(., file.path(tab_dir, "core_ortho_sens.tsv"))
+
+file.exists(file.path(tab_dir, "ob_uniq_ortho_sens.tsv"))
+```

@@ -1,0 +1,297 @@
+---
+title: "Alluvial/Sankey plot"
+output: html_notebook
+---
+
+Jacobo de la Cuesta-Zuluaga. October 2021.
+
+The aim of this notebook is to create an alluvial plot (also known as Sankey plot). This plot will show how the original set of features detected is divided in terms of prevalence, candidate status, and (non-)significance.
+
+I had some issues getting R packages for alluvial plots to work. Nevetheless, I found [this site](https://sankeymatic.com/build/), which allows to create these plots programatically and to export the SVG code, which I will save here.
+
+I created the following example with placeholder values:
+```
+'To be used in https://sankeymatic.com/build/
+'In the field named “Inputs”, enter one “Flow” per line, using this format: Source [Number] Target
+Detected [150] Candidate
+Detected [150] Not candidate
+Candidate [100] Prevalent
+Candidate [50] Not Prevalent 
+Prevalent [70] Non significant
+Prevalent [20] Unique OB
+Prevalent [5] Shared
+Prevalent [5] Unique CHS
+
+'Set colors
+:Detected #FCBFB7
+:Candidate #FCBFB7
+:Prevalent #FCBFB7
+:Unique OB #4E79A7
+:Shared #76B7B2
+:Unique CHS #F28E2B
+:Not candidate #808080
+:Not Prevalent #808080
+:Non significant #808080
+```
+
+
+# Libraries
+```{r}
+library(tidyverse)
+```
+
+# Load
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+#LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2019_01_GTDB/humann2")
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+```
+
+Set seed
+```{r}
+set.seed(1990)
+#plan(multisession, workers = 2)
+```
+
+## Load result tables
+### Modules
+```{r}
+# OB modules
+ob_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/ob_uniq_mod_meds.tsv" %>% 
+  read_tsv() 
+
+# CHS modules
+chs_mod_meds  = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/chs_uniq_mod_meds.tsv" %>% 
+  read_tsv() 
+
+# Core shared modules
+core_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/core_mod_meds.tsv" %>% 
+  read_tsv()
+```
+
+### Orthologs
+```{r}
+tab_dir %>% list_files(pattern = "ortho_(meds|sens|feats)")
+
+# OB orthologs
+ob_ortho_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/ob_uniq_ortho_meds.tsv" %>% 
+  read_tsv() 
+
+# CHS orthologs
+chs_ortho_meds  = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/chs_uniq_ortho_meds.tsv" %>% 
+  read_tsv() 
+
+# Core shared orthologs
+core_ortho_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/core_ortho_meds.tsv" %>% 
+  read_tsv()
+```
+
+### Summaries
+```{r}
+## Summary
+# Col_module_summ = fread(file.path(base_dir,
+#                                       "code/metagenome_profiles/R_notebooks/Tables/Candidate_Modules.tsv"), 
+#                                      data.table = FALSE)
+# Col_ortho_summ = fread(file.path(base_dir,
+#                                       "code/metagenome_profiles/R_notebooks/Tables/Candidate_Orthologs.tsv"), 
+#                                     data.table = FALSE)
+Col_module_summ = read_tsv(file.path(base_dir, 
+                                  "code/metagenome_profiles/R_notebooks/Tables/Full_Mod_Summ.tsv"))
+Col_ortho_summ = read_tsv(file.path(base_dir, 
+                                  "code/metagenome_profiles/R_notebooks/Tables/Full_Ortho_Summ.tsv"))
+
+```
+
+# Create SankeyMATIC code
+## Modules
+### Common to all plots
+```{r}
+Detected_mods = Col_module_summ %>% 
+  select(Module, Candidate, Prevalence_group)
+nrow(Detected_mods)
+
+n_candidates = Detected_mods %>% 
+  count(Candidate)
+
+candidate_true = n_candidates[1,2] %>% pull
+candidate_false = n_candidates[2,2] %>% pull
+```
+
+```{r}
+Candidate_mods = Detected_mods %>% 
+  filter(Candidate == "Yes")
+
+#Prevalence_group %in% c("High", "Mid_high")
+prevalent_true = Candidate_mods %>% 
+  count(Prevalence_group) %>% 
+  filter(Prevalence_group %in% c("High", "Mid_high")) %>% 
+  summarise(Prevalence_retained = sum(n)) %>% 
+  pull()
+
+prevalent_false = Candidate_mods %>% 
+  count(Prevalence_group) %>% 
+  filter(!(Prevalence_group %in% c("High", "Mid_high"))) %>% 
+  summarise(Prevalence_removed = sum(n)) %>% 
+  pull()
+```
+
+### BMI-adjusted modules
+```{r}
+bmi_unique = ob_mod_meds %>% 
+  filter(metadata == "BMI") %>% 
+  nrow()
+
+# CHS modules
+chs_bmi_unique = chs_mod_meds  %>% 
+  filter(adj == "BMI") %>% 
+  nrow()
+
+# Core shared modules
+core_bmi = core_mod_meds %>% 
+  filter(metadata == "BMI") %>% 
+  nrow()
+
+non_significant_bmi = prevalent_true - bmi_unique - chs_bmi_unique - core_bmi
+
+
+c(candidate_true = candidate_true, 
+  candidate_false = candidate_false, 
+  prevalent_true = prevalent_true,
+  prevalent_false = prevalent_false,
+  non_significant_bmi = non_significant, 
+  bmi_unique = bmi_unique, 
+  chs_bmi_unique = chs_bmi_unique, 
+  core_bmi = core_bmi)
+
+```
+
+```
+Detected [150] Candidate
+Detected [151] Not candidate
+Candidate [136] Prevalent
+Candidate [14] Not Prevalent 
+Prevalent [76] Non-significant
+Prevalent [39] Unique OB
+Prevalent [2] Unique CHS
+Prevalent [19] Shared
+
+:Detected #4A4A4A
+:Candidate #390040
+:Prevalent #390040
+:Unique OB #4E79A7
+:Shared #76B7B2
+:Unique CHS #F28E2B
+:Not candidate #808080
+:Not Prevalent #808080
+:Non-significant #808080
+```
+
+### Waist Circumference-adjusted modules
+```{r}
+wc_unique = ob_mod_meds %>% 
+  filter(metadata == "Waist_Circumference") %>% 
+  nrow()
+
+# CHS modules
+chs_wc_unique = chs_mod_meds  %>% 
+  filter(adj == "Waist_Circumference") %>% 
+  nrow()
+
+# Core shared modules
+core_wc = core_mod_meds %>% 
+  filter(metadata == "Waist_Circumference") %>% 
+  nrow()
+
+non_significant_wc = prevalent_true - wc_unique - chs_wc_unique - core_wc
+
+
+c(candidate_true = candidate_true, 
+  candidate_false = candidate_false, 
+  prevalent_true = prevalent_true,
+  prevalent_false = prevalent_false,
+  non_significant_wc = non_significant_wc, 
+  wc_unique = wc_unique, 
+  chs_wc_unique = chs_wc_unique, 
+  core_wc = core_wc)
+
+```
+
+```
+Detected [150] Candidate
+Detected [151] Not candidate
+Candidate [136] Prevalent
+Candidate [14] Not Prevalent 
+Prevalent [73] Non-significant
+Prevalent [47] Unique OB
+Prevalent [1] Unique CHS
+Prevalent [15] Shared
+
+:Detected #4A4A4A
+:Candidate #390040
+:Prevalent #390040
+:Unique OB #4E79A7
+:Shared #76B7B2
+:Unique CHS #F28E2B
+:Not candidate #808080
+:Not Prevalent #808080
+:Non-significant #808080
+```
+
+### Body Fat-adjusted modules
+```{r}
+bf_unique = ob_mod_meds %>% 
+  filter(metadata == "Fat_percentage") %>% 
+  nrow()
+
+# CHS modules
+chs_bf_unique = chs_mod_meds  %>% 
+  filter(adj == "Fat_percentage") %>% 
+  nrow()
+
+# Core shared modules
+core_bf = core_mod_meds %>% 
+  filter(metadata == "Fat_percentage") %>% 
+  nrow()
+
+non_significant_bf = prevalent_true - bf_unique - chs_bf_unique - core_bf
+
+
+c(candidate_true = candidate_true, 
+  candidate_false = candidate_false, 
+  prevalent_true = prevalent_true,
+  prevalent_false = prevalent_false,
+  non_significant_bf = non_significant_bf, 
+  bf_unique = bf_unique, 
+  chs_bf_unique = chs_bf_unique, 
+  core_bf = core_bf)
+```
+
+```
+Detected [150] Candidate
+Detected [151] Not candidate
+Candidate [136] Prevalent
+Candidate [14] Not Prevalent 
+Prevalent [99] Non-significant
+Prevalent [7] Unique OB
+Prevalent [6] Unique CHS
+Prevalent [24] Shared
+
+:Detected #4A4A4A
+:Candidate #390040
+:Prevalent #390040
+:Unique OB #4E79A7
+:Shared #76B7B2
+:Unique CHS #F28E2B
+:Not candidate #808080
+:Not Prevalent #808080
+:Non-significant #808080
+```

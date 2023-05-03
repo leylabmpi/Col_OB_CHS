@@ -1,0 +1,904 @@
+---
+title: "Summarize results of LMs"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. May 2021.
+
+The goal of this notebook is to compare the features that are significantly associated to the different obesity measures, namely, BMI, % Body Fat and Waist Circumference. For this, I will use the results of the linear models where I included age, city, sex and medication use as covariates.
+
+
+# Init
+Load packages
+```{r}
+# Misc
+library(LeyLabRMisc)
+library(conflicted)
+
+# Graphs
+library(cowplot)
+library(ggupset)
+
+# Data manipulation
+library(glue)
+library(data.table)
+library(tidyverse)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+#LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2019_01_GTDB/humann2")
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+```
+
+Set seed
+```{r}
+set.seed(1990)
+#plan(multisession, workers = 2)
+```
+
+## Load result tables
+### Modules
+```{r}
+# OB modules
+ob_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/ob_uniq_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# CHS modules
+chs_mod_meds  = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/chs_uniq_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# Core shared modules
+core_mod_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/core_mod_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+```
+
+### Orthologs
+```{r}
+tab_dir %>% list_files(pattern = "ortho_(meds|sens|feats)")
+
+# OB orthologs
+ob_ortho_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/ob_uniq_ortho_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# CHS orthologs
+chs_ortho_meds  = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/chs_uniq_ortho_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+
+# Core shared orthologs
+core_ortho_meds = "/ebio/abt3_projects/columbian_gut_metagenome/code/metagenome_profiles/R_notebooks/Tables/core_ortho_meds.tsv" %>% 
+  read_tsv() %>% 
+  mutate(metadata = str_remove(metadata, "_adj.*"))
+```
+
+# Comparison - Modules
+
+## Unique sets vs. Core
+```{r}
+#BMI
+ob_bmi_df = ob_mod_meds %>% 
+  filter(metadata == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "BMI")
+
+chs_bmi_df = chs_mod_meds %>% 
+  filter(adj == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "BMI")
+  
+
+core_bmi_df = core_mod_meds %>% 
+  filter(adj == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "BMI")
+
+bmi_df = bind_rows(ob_bmi_df, chs_bmi_df, core_bmi_df)
+
+
+# WC
+ob_wc_df = ob_mod_meds %>% 
+  filter(metadata == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "Waist Circumference")
+
+chs_wc_df = chs_mod_meds %>% 
+  filter(adj == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "Waist Circumference")
+  
+
+core_wc_df = core_mod_meds %>% 
+  filter(adj == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "Waist Circumference")
+
+wc_df = bind_rows(ob_wc_df, chs_wc_df, core_wc_df)
+
+# BF
+ob_bf_df = ob_mod_meds %>% 
+  filter(metadata == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "Body Fat (%)")
+
+chs_bf_df = chs_mod_meds %>% 
+  filter(adj == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "Body Fat (%)")
+  
+
+core_bf_df = core_mod_meds %>% 
+  filter(adj == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "Body Fat (%)")
+
+bf_df = bind_rows(ob_bf_df, chs_bf_df, core_bf_df)
+```
+
+```{r}
+# Create count table and include levels with 0 counts for plot
+bmi_df_count = bmi_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "CHS-unique", quick_assoc = "Health", adj = "BMI", n = 0))
+
+wc_df_count = wc_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "CHS-unique", quick_assoc = "Health", adj = "Waist Circumference", n = 0))
+
+bf_df_count = bf_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "Ob-unique", quick_assoc = "Health", adj = "Body Fat (%)", n = 0)) %>% 
+  bind_rows(., data.frame(set = "Ob-unique", quick_assoc = "Disease", adj = "Body Fat (%)", n = 0))
+
+# Create a single table for plot
+Ob_df_count = bind_rows(bmi_df_count, wc_df_count, bf_df_count) %>% 
+  mutate(adj = factor(adj, levels = c("BMI", "Waist Circumference", "Body Fat (%)")))
+```
+
+
+```{r fig.height=5, fig.width=10}
+# Plot number of significant hits
+Ob_mod_barplot = Ob_df_count %>% 
+  mutate(set = str_replace(set, "Shared-core", "Shared"),
+         set = str_replace(set, "Ob-unique", "OB-unique"),
+         set = factor(set, levels = c("OB-unique", "CHS-unique", "Shared")), 
+         adj =  str_replace(adj, fixed("Body Fat (%)"), "BF%"), 
+         adj = str_replace(adj, "Waist Circumference", "WC"), 
+         adj = factor(adj, levels = c("BMI", "WC", "BF%"))) %>% 
+  ggplot(aes(x = set, y = n, fill = quick_assoc)) +
+    geom_col(position="dodge") +
+    theme_light() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) + #A7ADC6
+    labs(x = "Set", y = "Number of associated modules", fill = "Health association direction") +
+    facet_wrap(~adj) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          legend.position = "top", 
+          strip.background = element_rect(colour="white", fill="white"),
+          strip.text = element_text(colour = 'black'), 
+          text = element_text(size = 15))
+
+Ob_mod_barplot
+
+save_plot(filename = file.path(fig_dir, "Ob_mod_barplot.png"), Ob_mod_barplot,
+          base_height = 5, base_width = 10)
+```
+
+
+
+## Unique to BMI
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+ob_compare = ob_mod_meds %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+ob_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+ob_compare %>% 
+  filter(n > 1) %>%
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+```
+
+```{r}
+# Features associated with each Ob measure
+ob_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+ob_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r fig.height=4, fig.width=6}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+ob_mod_assoc = ob_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc) #%>% 
+  # mutate(quick_assoc = factor(ifelse(quick_assoc == "Health", "Negative", "Positive"), 
+  #                             levels = c("Positive", "Negative")))
+
+ob_UpSet_df = ob_compare %>%  
+  mutate(metadata = str_replace(metadata, "_", " "),
+         metadata = str_replace(metadata, "Fat percentage", "BF%"), 
+         metadata = str_replace(metadata, "Waist Circumference", "WC"))
+  
+  # mutate(quick_assoc = factor(ifelse(quick_assoc == "Health", "Negative", "Positive"), 
+  #                             levels = c("Positive", "Negative")), 
+  #        metadata = str_replace(metadata, "_", " "), 
+  #        metadata = str_replace(metadata, "Fat percentage", "Body Fat (%)"))
+  
+# Create large UpSet Plot
+Ob_UpSet_mod = ob_UpSet_df %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., ob_mod_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm"), 
+          legend.position = "none", 
+          text = element_text(size = 14)) + 
+    labs(x = "", y = "Numer of\nassociated modules")
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+Ob_Setsize_mod = ob_UpSet_df %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", 
+          axis.text.y = element_blank(), 
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(), 
+          axis.ticks = element_blank(), 
+          text = element_text(size = 12))
+
+# Combine plots. See ggupset github issues for details
+Ob_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, Ob_Setsize_mod + theme(plot.margin = unit(c(1, 0, -12, 1), "pt")), ncol = 1, rel_heights = c(3, 1)), # size of small set size plot
+  Ob_UpSet_mod, nrow = 1, rel_widths = c(1, 3.5) # Size of large UpSet plot
+)
+
+Ob_Upset_plot 
+
+save_plot(filename = file.path(fig_dir, "Ob_measure_UpSet.png"), Ob_Upset_plot, base_height = 4, base_width = 6)
+```
+
+## Unique to CHS
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+chs_compare = chs_mod_meds %>% 
+  mutate(metadata = adj) %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+chs_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+chs_compare %>% 
+  filter(n > 1) %>% 
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+
+# Features that are unique to CHS depending on how is obesity controlled
+chs_compare %>% 
+  filter(n == 1) %>% 
+  arrange(quick_assoc, feature)
+```
+
+```{r}
+# Features associated with each Ob measure
+chs_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+chs_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+chs_mod_assoc = chs_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc)
+  
+# Create large UpSet Plot
+CHS_UpSet_mod = chs_compare %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., chs_mod_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm"), 
+          text = element_text(size = 15)) + NULL
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+CHS_Setsize_mod = chs_compare %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", 
+          axis.text.y = element_blank(), 
+          text = element_text(size = 12))
+
+# Combine plots. See ggupset github issues for details
+CHS_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, CHS_Setsize_mod + theme(plot.margin = unit(c(1, -5, -5, 1), "pt")), ncol = 1, rel_heights = c(5.45, 1)), # size of small set size plot
+  CHS_UpSet_mod, nrow = 1, rel_widths = c(1, 4) # Size of large UpSet plot
+)
+
+CHS_Upset_plot
+```
+
+
+## Core
+
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+core_compare = core_mod_meds %>% 
+  mutate(metadata = adj) %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+core_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+core_compare %>% 
+  filter(n > 1) %>% 
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+
+# Features that are unique to CHS depending on how is obesity controlled
+core_compare %>% 
+  filter(n == 1) %>% 
+  arrange(quick_assoc, feature)
+```
+
+```{r}
+# Features associated with each Ob measure
+core_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+core_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+core_mod_assoc = core_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc)
+  
+# Create large UpSet Plot
+core_UpSet_mod = core_compare %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., core_mod_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm"), 
+          text = element_text(size = 15)) + NULL
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+core_Setsize_mod = core_compare %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", 
+          axis.text.y = element_blank(), 
+          text = element_text(size = 12))
+
+# Combine plots. See ggupset github issues for details
+core_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, core_Setsize_mod + theme(plot.margin = unit(c(1, -5, -5, 1), "pt")), ncol = 1, rel_heights = c(5.45, 1)), # size of small set size plot
+  core_UpSet_mod, nrow = 1, rel_widths = c(1, 4) # Size of large UpSet plot
+)
+
+core_Upset_plot
+```
+
+```{r}
+stop("Run plots with orthologs, rewrite some objects. If executing 'run all', continue manually")
+```
+
+# Comparison - Orthologs
+
+## Unique sets vs. Core
+
+```{r}
+#BMI
+ob_bmi_df = ob_ortho_meds %>% 
+  filter(metadata == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "BMI")
+
+chs_bmi_df = chs_ortho_meds %>% 
+  filter(adj == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "BMI")
+  
+
+core_bmi_df = core_ortho_meds %>% 
+  filter(adj == "BMI") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "BMI")
+
+bmi_df = bind_rows(ob_bmi_df, chs_bmi_df, core_bmi_df)
+
+
+# WC
+ob_wc_df = ob_ortho_meds %>% 
+  filter(metadata == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "Waist Circumference")
+
+chs_wc_df = chs_ortho_meds %>% 
+  filter(adj == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "Waist Circumference")
+  
+
+core_wc_df = core_ortho_meds %>% 
+  filter(adj == "Waist_Circumference") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "Waist Circumference")
+
+wc_df = bind_rows(ob_wc_df, chs_wc_df, core_wc_df)
+
+# BF
+ob_bf_df = ob_ortho_meds %>% 
+  filter(metadata == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Ob-unique", adj = "Body Fat (%)")
+
+chs_bf_df = chs_ortho_meds %>% 
+  filter(adj == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "CHS-unique", adj = "Body Fat (%)")
+  
+
+core_bf_df = core_ortho_meds %>% 
+  filter(adj == "Fat_percentage") %>% 
+  select(feature, annot, quick_assoc) %>% 
+  mutate(set = "Shared-core", adj = "Body Fat (%)")
+
+bf_df = bind_rows(ob_bf_df, chs_bf_df, core_bf_df)
+
+
+
+
+```
+
+```{r}
+# Create count table and include levels with 0 counts for plot
+bmi_df_count = bmi_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "CHS-unique", quick_assoc = "Health", adj = "BMI", n = 0))
+
+wc_df_count = wc_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "CHS-unique", quick_assoc = "Health", adj = "Waist Circumference", n = 0))
+
+bf_df_count = bf_df %>% 
+  count(set, quick_assoc, adj) %>% 
+  bind_rows(., data.frame(set = "Ob-unique", quick_assoc = "Health", adj = "Body Fat (%)", n = 0)) %>% 
+  bind_rows(., data.frame(set = "Ob-unique", quick_assoc = "Disease", adj = "Body Fat (%)", n = 0))
+
+# Create a single table for plot
+Ob_df_count = bind_rows(bmi_df_count, wc_df_count, bf_df_count) %>% 
+  mutate(adj = factor(adj, levels = c("BMI", "Waist Circumference", "Body Fat (%)")))
+```
+
+
+```{r fig.height=4, fig.width=10}
+# Plot number of significant hits
+Ob_ortho_barplot = Ob_df_count %>% 
+  mutate(set = str_replace(set, "Shared-core", "Shared"),
+         set = factor(set, levels = c("Ob-unique", "CHS-unique", "Shared"))) %>% 
+  ggplot(aes(x = set, y = n, fill = quick_assoc)) +
+    geom_col(position="dodge") +
+    theme_light() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) + #A7ADC6
+    labs(x = "Set", y = "Associated modules", fill = "Health association direction") +
+    facet_wrap(~adj) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+          legend.position = "bottom", 
+          strip.background = element_rect(colour="white", fill="white"),
+          strip.text = element_text(colour = 'black'))
+
+Ob_ortho_barplot
+
+save_plot(filename = file.path(fig_dir, "Ob_ortho_barplot.png"), Ob_ortho_barplot, base_height = 4, base_width = 10)
+```
+
+
+
+## Unique to BMI
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+ob_compare = ob_ortho_meds %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+ob_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+ob_compare %>% 
+  filter(n > 1) %>%
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+```
+
+```{r}
+# Features associated with each Ob measure
+ob_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+ob_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r fig.height=5, fig.width=8}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+ob_ortho_assoc = ob_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc) #%>% 
+  # mutate(quick_assoc = factor(ifelse(quick_assoc == "Health", "Negative", "Positive"), 
+  #                             levels = c("Positive", "Negative")))
+
+ob_UpSet_df = ob_compare %>%  
+  mutate(metadata = str_replace(metadata, "_", " "),
+         metadata = str_replace(metadata, "Fat percentage", "Body Fat (%)"))
+  
+  # mutate(quick_assoc = factor(ifelse(quick_assoc == "Health", "Negative", "Positive"), 
+  #                             levels = c("Positive", "Negative")), 
+  #        metadata = str_replace(metadata, "_", " "), 
+  #        metadata = str_replace(metadata, "Fat percentage", "Body Fat (%)"))
+  
+# Create large UpSet Plot
+Ob_UpSet_ortho = ob_UpSet_df %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., ob_ortho_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm"), 
+          panel.border = element_rect(fill = NA, color = "lightgrey")) + 
+    labs(fill = "Health association\ndirection", x = "",y = "Associated orthoules")
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+Ob_Setsize_ortho = ob_UpSet_df %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", axis.text.y = element_blank())
+
+# Combine plots. See ggupset github issues for details
+Ob_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, Ob_Setsize_ortho + theme(plot.margin = unit(c(1, -5, -5, 1), "pt")), ncol = 1, rel_heights = c(5.45, 1)), # size of small set size plot
+  Ob_UpSet_ortho, nrow = 1, rel_widths = c(1, 4) # Size of large UpSet plot
+)
+
+Ob_Upset_plot
+
+#save_plot(filename = file.path(fig_dir, "Ob_measure_UpSet.png"), Ob_Upset_plot, base_height = 5, base_width = 8)
+```
+
+## Unique to CHS
+
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+chs_compare = chs_ortho_meds %>% 
+  mutate(metadata = adj) %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+chs_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+chs_compare %>% 
+  filter(n > 1) %>% 
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+
+# Features that are unique to CHS depending on how is obesity controlled
+chs_compare %>% 
+  filter(n == 1) %>% 
+  arrange(quick_assoc, feature)
+```
+
+```{r}
+# Features associated with each Ob measure
+chs_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+chs_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+chs_ortho_assoc = chs_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc)
+  
+# Create large UpSet Plot
+CHS_UpSet_ortho = chs_compare %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., chs_ortho_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm")) + NULL
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+CHS_Setsize_ortho = chs_compare %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", axis.text.y = element_blank())
+
+# Combine plots. See ggupset github issues for details
+CHS_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, CHS_Setsize_ortho + theme(plot.margin = unit(c(1, -5, -5, 1), "pt")), ncol = 1, rel_heights = c(5.45, 1)), # size of small set size plot
+  CHS_UpSet_ortho, nrow = 1, rel_widths = c(1, 4) # Size of large UpSet plot
+)
+
+CHS_Upset_plot
+```
+
+
+## Core
+
+```{r}
+# Create table with count of measures associated
+# e.g. 1 if only BMI, 3 if BMI, WC and %BF
+core_compare = core_ortho_meds %>% 
+  mutate(metadata = adj) %>% 
+  add_count(feature) %>% 
+  arrange(-n, feature) %>% 
+  select(feature, annot, quick_assoc, metadata, n)
+
+core_compare %>% dfhead()
+```
+
+```{r}
+# Are there contradictory associations
+# e.g. health with BMI but disease with BF?
+# If not, counts > 1 for all features
+core_compare %>% 
+  filter(n > 1) %>% 
+  group_by(feature) %>% 
+  count(quick_assoc) %>% 
+  arrange(n)
+
+# Features that are unique to CHS depending on how is obesity controlled
+core_compare %>% 
+  filter(n == 1) %>% 
+  arrange(quick_assoc, feature)
+```
+
+```{r}
+# Features associated with each Ob measure
+core_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(metadata)
+```
+
+```{r}
+# Features by number of measures
+core_compare %>%
+  arrange(quick_assoc, feature) %>% 
+  group_split(n)
+```
+
+```{r}
+# Plots
+# UpSet plot of measure association
+# Create df of feature association (no contradictory associations so no prob)
+core_ortho_assoc = core_compare %>% 
+  group_by(feature) %>% 
+  slice(1) %>% 
+  select(feature, quick_assoc)
+  
+# Create large UpSet Plot
+core_UpSet_ortho = core_compare %>% 
+  select(feature, metadata) %>%
+  group_by(feature) %>% 
+  summarize(metadata = list(metadata)) %>%  
+  left_join(., core_ortho_assoc,  by = "feature") %>% 
+  ggplot(aes(x = metadata, fill = quick_assoc)) +
+    geom_bar() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    scale_x_upset() +
+    theme_light() +
+    theme(plot.margin = margin(0, 0, 0, 2.5, "cm")) + NULL
+    #theme_combmatrix(combmatrix.panel.point.color.fill = "gray30", combmatrix.panel.line.size = 0)
+    #geom_text(stat='count', aes(label=after_stat(count)))
+
+# Add set size plot
+core_Setsize_ortho = core_compare %>% 
+  mutate(metadata = fct_rev(fct_infreq(metadata))) %>% 
+  select(feature, metadata, quick_assoc)  %>% 
+  count(metadata, quick_assoc) %>% 
+  ggplot(aes(x = metadata, y = n, fill = quick_assoc)) +
+    geom_col() +
+    scale_fill_manual(values = c('#700548', "#A7ADC6")) +
+    coord_flip() +
+    scale_y_reverse() +
+    theme_light()  +
+    labs(x = "", y = "") +
+    theme(legend.position = "none", axis.text.y = element_blank())
+
+# Combine plots. See ggupset github issues for details
+core_Upset_plot = cowplot::plot_grid(
+  cowplot::plot_grid(NULL, core_Setsize_ortho + theme(plot.margin = unit(c(1, -5, -5, 1), "pt")), ncol = 1, rel_heights = c(5.45, 1)), # size of small set size plot
+  core_UpSet_ortho, nrow = 1, rel_widths = c(1, 4) # Size of large UpSet plot
+)
+
+core_Upset_plot
+```
+

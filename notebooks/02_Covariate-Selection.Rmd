@@ -1,0 +1,767 @@
+---
+title: "Covariate assessment"
+output: html_notebook
+---
+
+# Goal
+Jacobo de la Cuesta Zuluaga. December 2020.
+
+The goal of this notebook is to perform variable selection to determine the appropiate covariates to include in the linear models of gut microbiota
+
+# Init
+Load packages
+```{r}
+# Misc
+library(LeyLabRMisc)
+library(conflicted)
+
+# Graphs
+library(cowplot)
+library(ggpubr)
+library(UpSetR)
+
+# Data manipulation
+library(data.table)
+library(tidyverse)
+library(glue)
+
+# Analysis
+library(vegan)
+library(MatchIt)
+library(report)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+# Var
+Load tables and prepare data
+```{r}
+# Directories
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+#LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2019_01_GTDB/humann2")
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+Feat_map_dir = "/ebio/abt3_projects/databases_no-backup/humann2/utility_mapping"
+metadata_dir = file.path(base_dir, "data/metadata")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+tab_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Tables")
+logratios_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/2020_04_log_ratios")
+annotation_dir = file.path(base_dir, "data/metagenome_profile/intermediate_files/Annotations/")
+```
+
+Set seed
+```{r}
+set.seed(1990)
+#plan(multisession, workers = 2)
+```
+
+
+## Load tables
+Load metagenome coverage data from nonpareil to determine the samples to retain for analyses. In this case I will use samples with more than 500.000 reads or that have a metagenome coverage above 60%. This according to doi:10.1128/mSystems.00069-18, doi:10.1371/journal.pcbi.1004573 and doi:10.1038/ismej.2014.76
+```{r}
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") 
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    slice(-9) %>% #Remove duplicated entry of MI-353-H
+    mutate(Sample = str_replace_all(Sample, "-", "_"))
+nonpareil_table %>% dfhead()
+
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+```
+Load the metadata of the subjects to be used in differential proportionality and abundance analyses.
+```{r}
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+    fread(., data.table = F)
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                           "Overweight-Healthy", "Overweight-Abnormal",
+                                           "Obese-Healthy", "Obese-Abnormal"))) %>% 
+  rename("Dyslipidemia_med" = "Dislipid_med")
+```
+
+Load the clr-transformed functional profile tables. Recall to calculate the clr-transform, I removed the unmapped and the unintegrated features which are technically but not biologically relevant. See CoDa-transformations notebook.
+```{r}
+# Metacyc pathways
+Col_pwy_clr = file.path(logratios_dir, "pwy_clr.tsv.gz") %>%
+    fread(., data.table = F) 
+
+# level 4 enzyme commission
+Col_ec_clr = file.path(logratios_dir, "ec_clr.tsv.gz") %>%
+    fread(., data.table = F) 
+
+# KOs
+Col_ko_clr = file.path(logratios_dir, "ko_clr.tsv.gz") %>%
+    fread(., data.table = F) 
+```
+
+Load the summary of the pathways and filter tables
+```{r}
+# Metacyc
+Col_pwy_clr_summ = file.path(logratios_dir, "pwy_summary.tsv.gz") %>% 
+  fread(., data.table = F)
+
+retained_pwys = Col_pwy_clr_summ %>% 
+  filter(Prevalence_group != "Low") %>% 
+  pull(Feature)
+
+pwy_filt_clr = Col_pwy_clr %>% 
+  select(Feat_Sample, one_of(retained_pwys))
+
+# EC
+Col_ec_clr_summ = file.path(logratios_dir, "ec_summary.tsv.gz") %>% 
+  fread(., data.table = F)
+
+retained_ec = Col_ec_clr_summ %>% 
+  filter(Prevalence_group != "Low") %>% 
+  pull(Feature)
+
+ec_filt_clr = Col_ec_clr %>% 
+  select(Feat_Sample, one_of(retained_ec))
+
+# KOs
+Col_ko_clr_summ = file.path(logratios_dir, "ko_summary.tsv.gz") %>% 
+  fread(., data.table = F)
+
+retained_kos = Col_ko_clr_summ %>% 
+  filter(Prevalence_group != "Low") %>% 
+  pull(Feature)
+
+ko_filt_clr = Col_ko_clr %>% 
+  select(Feat_Sample, one_of(retained_kos))
+
+```
+
+Feature descriptions and annotations
+```{r}
+metacyc_annot = read_delim(file.path(annotation_dir, "metacyc_annot.tsv"), delim = "\t")
+
+metacyc_annot %>% dfhead()
+
+ec_annot = read_delim(file.path(annotation_dir, "ec_annot.tsv"), delim = "\t")
+
+ec_annot %>% dfhead()
+
+ko_annot = read_delim(file.path(annotation_dir, "ko_annot.tsv"), delim = "\t")
+
+ko_annot %>% dfhead()
+```
+
+# Correlation of covariates
+# A-diversity analyses
+```{r}
+# Table of alpha diversity of Colombian samples
+aDiv_table = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI"))
+
+aDiv_table %>% dfhead()
+```
+
+```{r}
+# Transform medication data and create sinlge table with diversity
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dyslipidemia_med", "PPI_med")
+
+# Create df with med use and number of meds consumed
+Meds_table = Col_metadata %>% 
+  select(matches("_med")) %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0))) %>% 
+  rowwise() %>% 
+  bind_cols(., total = rowSums(.)) %>% 
+  as.data.frame()
+
+Col_metadata_meds = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_Meds = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+
+# Add richness data
+Col_metadata_aDiv = full_join(Col_metadata_meds, aDiv_table, by = c("ID" = "Sample"))
+
+
+
+```
+
+## Medication usage
+```{r}
+# Number of consumed medications
+Meds_hist_plt = Col_metadata_meds %>% 
+  ggplot(aes(x = n_Meds)) +
+    geom_histogram(binwidth = 1) +
+    theme_light() +
+    labs(x = "Number of Individuals", y = "Medications used")
+
+Meds_upset_plt = Col_metadata_meds %>% 
+  select(Meds_vars, n_Meds) %>% 
+  mutate(No_med = ifelse(n_Meds == 0, 1, 0)) %>% 
+  upset(., sets = c(Meds_vars, "No_med"), order.by = c("freq", "degree"), text.scale = 1.5)
+
+Meds_upset_plt
+
+# Table of n meds usage
+Col_metadata_aDiv %>% janitor::tabyl(n_Meds)
+```
+
+```{r}
+# Consumption of multiple medications
+# Fit a cubic spline
+Col_metadata_aDiv %>% 
+  ggplot(aes(x = n_Meds, y = diversity)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    coord_cartesian(ylim = c(13, 19)) +
+    geom_smooth(color = "steelblue", method = lm, formula = y ~ splines::bs(x, 3)) +
+    theme_light() +
+    labs(x = "Number of Medications", y = "Metagenome diversity") +
+    stat_cor(method = "spearman", label.y = 20) +
+    theme(text = element_text(size = 15))      
+
+cor.test(x = Col_metadata_aDiv$diversity, y = Col_metadata_aDiv$n_Meds, method = "spearman") %>% report()
+
+# As an anova
+aov(Col_metadata_aDiv$diversity ~ factor(Col_metadata_aDiv$n_Meds)) %>% 
+  TukeyHSD()
+
+# As an anova
+aov(Col_metadata_aDiv$diversity ~ factor(Col_metadata_aDiv$n_Meds)) %>% 
+  summary()
+
+# Kruskal test
+kruskal.test(Col_metadata_aDiv$diversity ~ factor(Col_metadata_aDiv$n_Meds))
+
+# Since only the contrast 0 - 4 is significant, I won't plot the other p values
+nMeds_plot = Col_metadata_aDiv %>% 
+  ggplot(aes(x = factor(n_Meds), y = diversity)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    coord_cartesian(ylim = c(13, 19.5)) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Number of Medications", y = "Metagenome diversity") +
+    stat_compare_means(comparisons = list(c("4", "0")), size = 5) +
+    stat_compare_means(method = "anova", label.y = 19.5, size = 5) +
+    theme(text = element_text(size = 15))
+
+```
+
+
+```{r fig.width=5, fig.height=5}
+# Differences in richness between individual medications
+# case-control differences pairing subjects with similar by age, sex, BMI, city
+# PPIs
+matched_ppi_model = matchit(PPI_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  Col_metadata_aDiv, method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex"))
+
+summary(matched_ppi_model, un = FALSE)
+
+matched_ppi = match.data(matched_ppi_model) %>% 
+  mutate(PPI_med = factor(ifelse(PPI_med == 0, "No", "Yes")))
+
+matched_ppi %>% 
+  group_by(PPI_med) %>% 
+  summarise(mean(diversity))
+
+# Plot distances before and after pairing
+MatchIt:::plot.summary.matchit(summary(matched_ppi_model, standardize = TRUE))
+
+matched_ppi_plot = matched_ppi %>% 
+  ggplot(aes(x = PPI_med, y = diversity)) +
+    coord_cartesian(ylim = c(13, 19)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "PPI med usage", y = "Metagenome diversity") + 
+    stat_compare_means(ref.group = "Yes", method = "t.test", method.args = list(alternative = "greater"), size = 5) +
+    theme(text = element_text(size = 15))
+
+matched_ppi %>% 
+  t.test(diversity~PPI_med, data = ., alternative = c("greater")) %>% 
+  report()
+
+# Strict model
+# Cases only consume 1 medication
+matched_ppi_strict_model = Col_metadata_aDiv %>% 
+  filter((PPI_med == 1 & n_Meds == 1) | (n_Meds == 0)) %>% 
+  matchit(PPI_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  ., method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex")) 
+
+matched_ppi_strict = match.data(matched_ppi_strict_model) %>% 
+  mutate(PPI_med = factor(ifelse(PPI_med == 0, "No", "Yes"))) 
+
+matched_ppi_strict %>% 
+  group_by(PPI_med) %>% 
+  summarise(mean(diversity))
+
+t.test(diversity~PPI_med, data = matched_ppi_strict, alternative = c("greater")) %>% report()
+```
+
+```{r fig.width=5, fig.height=5}
+# Differences in richness between individual medications
+# case-control differences pairing subjects with similar by age, sex, BMI, city
+# Hypertension medication
+matched_hyp_model = matchit(Hypertension_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  Col_metadata_aDiv, method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex"))
+
+summary(matched_hyp_model, un = FALSE)
+
+matched_hyp = match.data(matched_hyp_model) %>% 
+  mutate(Hypertension_med = factor(ifelse(Hypertension_med == 0, "No", "Yes")))
+
+# matched_hyp %>% 
+#   group_by(Hypertension_med) %>% 
+#   summarise(mean(diversity))
+
+matched_hyp_plot = matched_hyp %>% 
+  ggplot(aes(x = Hypertension_med, y = diversity)) +
+    coord_cartesian(ylim = c(13, 19)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Hypertension med usage", y = "Metagenome diversity") +
+    stat_compare_means(ref.group = "Yes", method = "t.test", method.args = list(alternative = "greater"), size = 5) +
+    theme(text = element_text(size = 15))
+
+t.test((diversity)~Hypertension_med, data = matched_hyp, alternative = c("greater")) %>% report()
+
+
+# Strict model
+# Cases only consume 1 medication
+matched_hyp_strict_model = Col_metadata_aDiv %>% 
+  filter((Hypertension_med == 1 & n_Meds == 1) | (n_Meds == 0)) %>% 
+  matchit(Hypertension_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  ., method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex")) 
+
+matched_hyp_strict = match.data(matched_hyp_strict_model) %>% 
+  mutate(Hypertension_med = factor(ifelse(Hypertension_med == 0, "No", "Yes")))
+
+matched_hyp_strict %>% 
+  group_by(Hypertension_med) %>% 
+  summarise(mean(diversity))
+
+t.test(diversity~Hypertension_med, data = matched_hyp_strict, alternative = c("greater")) %>% report()
+
+```
+
+```{r fig.width=5, fig.height=5}
+# Differences in richness between individual medications
+# case-control differences pairing subjects with similar by age, sex, BMI, city
+# Diabetes medication
+matched_diab_model = matchit(Diabetes_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  Col_metadata_aDiv, method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex"))
+
+summary(matched_diab_model, un = FALSE)
+
+matched_diab = match.data(matched_diab_model) %>% 
+  mutate(Diabetes_med = factor(ifelse(Diabetes_med == 0, "No", "Yes")))
+
+# matched_diab %>% 
+#   group_by(Diabetes_med) %>% 
+#   summarise(mean(diversity))
+
+matched_diab_plot = matched_diab %>% 
+  ggplot(aes(x = Diabetes_med, y = diversity)) +
+    coord_cartesian(ylim = c(13, 19)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Diabetes med usage", y = "Metagenome diversity") +
+    stat_compare_means(ref.group = "Yes", method = "t.test", method.args = list(alternative = "greater"), size = 5) +
+    theme(text = element_text(size = 15))
+
+t.test(diversity~Diabetes_med, data = matched_diab, alternative = c("greater")) %>% report()
+
+# Strict model
+# Cases only consume 1 medication
+matched_diab_strict_model = Col_metadata_aDiv %>% 
+  filter((Diabetes_med == 1 & n_Meds == 1) | (n_Meds == 0)) %>% 
+  matchit(Diabetes_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  ., method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex")) 
+
+matched_diab_strict = match.data(matched_diab_strict_model) %>% 
+  mutate(Diabetes_med = factor(ifelse(Diabetes_med == 0, "No", "Yes")))
+
+matched_diab_strict %>% 
+  group_by(Diabetes_med) %>% 
+  summarise(mean(diversity))
+
+t.test(diversity~Diabetes_med, data = matched_diab_strict, alternative = c("greater")) %>% report()
+```
+
+```{r fig.width=5, fig.height=5}
+# Differences in richness between individual medications
+# case-control differences pairing subjects with similar by age, sex, BMI, city
+# Dyslipidemia medication
+matched_dyslip_model = matchit(Dyslipidemia_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  Col_metadata_aDiv, method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex"))
+
+summary(matched_dyslip_model, un = FALSE)
+
+matched_dyslip = match.data(matched_dyslip_model) %>% 
+  mutate(Dyslipidemia_med = factor(ifelse(Dyslipidemia_med == 0, "No", "Yes")))
+
+matched_dyslip %>% 
+  group_by(Dyslipidemia_med) %>% 
+  summarise(mean(Fat_percentage))
+
+matched_dyslip_plot = matched_dyslip %>% 
+  ggplot(aes(x = Dyslipidemia_med, y = diversity)) +
+    coord_cartesian(ylim = c(13, 19)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Dyslipidemia med usage", y = "Metagenome diversity") +
+    stat_compare_means(ref.group = "Yes", method = "t.test", method.args = list(alternative = "greater"), size = 5) +
+    theme(text = element_text(size = 15))
+
+t.test((diversity)~Dyslipidemia_med, data = matched_dyslip, alternative = c("greater")) %>% report()
+
+# Strict model
+# Cases only consume 1 medication
+matched_dyslip_strict_model = Col_metadata_aDiv %>% 
+  filter((Dyslipidemia_med == 1 & n_Meds == 1) | (n_Meds == 0)) %>% 
+  matchit(Dyslipidemia_med ~ City + Sex + Age + Fat_percentage, 
+                  data =  ., method = "nearest", ratio = 3, 
+                  exact = c("City", "Sex")) 
+
+matched_dyslip_strict = match.data(matched_dyslip_strict_model) %>% 
+  mutate(Dyslipidemia_med = factor(ifelse(Dyslipidemia_med == 0, "No", "Yes")))
+
+matched_dyslip_strict %>% 
+  group_by(Dyslipidemia_med) %>% 
+  summarise(mean(diversity))
+
+t.test(diversity~Dyslipidemia_med, data = matched_dyslip_strict, alternative = c("greater")) %>% report()
+```
+
+## City and socioeconomic status
+```{r}
+aDiv_City_plt = Col_metadata_aDiv %>% 
+  ggplot(aes(x = City, y = diversity)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    coord_cartesian(ylim = c(13, 19)) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "City", y = "Metagenome diversity") +
+    theme(axis.text.x = element_text(angle=45)) +
+    stat_compare_means(label.y = 19, method = "anova", size = 5) +
+    theme(text = element_text(size = 15))
+
+aov(diversity ~ factor(City), Col_metadata_aDiv) %>% report()
+aov(diversity ~ factor(City), Col_metadata_aDiv) %>% summary
+
+aDiv_Stratum_plt = Col_metadata_aDiv %>% 
+  ggplot(aes(x = factor(Socioeconomic_level), y = diversity)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey") +
+    coord_cartesian(ylim = c(13, 19)) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Socioeconomic level", y = "Metagenome diversity") +
+    stat_compare_means(label.y = 19, method = "anova", size = 5) +
+    theme(text = element_text(size = 15))
+
+aov(diversity ~ factor(Socioeconomic_level), Col_metadata_aDiv) %>% report()
+aov(diversity ~ factor(Socioeconomic_level), Col_metadata_aDiv) %>% summary
+
+plot_grid(aDiv_City_plt, aDiv_Stratum_plt, align = "h", labels = "AUTO")
+```
+
+## Sex and Age
+```{r fig.width=7, fig.height=4}
+aDiv_Age_plt = Col_metadata_aDiv %>% 
+  ggplot(aes(x = Age, y = diversity)) +
+    geom_point(color = "grey") +
+    coord_cartesian(ylim = c(13, 19)) +
+    theme_light() +
+    geom_smooth(color = "steelblue", method = "lm") +
+    labs(x = "Age", y = "Metagenome diversity") +
+    stat_cor(method = "spearman", label.y = 19, size = 5) +
+    theme(text = element_text(size = 15))
+
+cor.test(x = Col_metadata_aDiv$diversity, y = Col_metadata_aDiv$Age, method = "spearman") %>% report()
+
+aDiv_Sex_plt = Col_metadata_aDiv %>% 
+  ggplot(aes(x = Sex, y = diversity)) +
+    geom_jitter(position=position_jitter(0.1), color = "grey", alpha = 0.75) +
+    coord_cartesian(ylim = c(13, 19)) +
+    stat_summary(fun.data=mean_sdl, fun.args = list(mult=1), geom="pointrange", color="black", size = 0.75) +
+    theme_light() +
+    labs(x = "Sex", y = "Metagenome diversity") +
+    stat_compare_means(method = "t.test", label.y = 19, size = 5) +
+    theme(text = element_text(size = 15))
+
+t.test(diversity~Sex, data = Col_metadata_aDiv, alternative = c("two.sided")) %>% report()
+
+
+plot_grid(aDiv_Age_plt, aDiv_Sex_plt, align = "h", labels = "AUTO")
+```
+
+## Stepwise selection
+```{r}
+# I will use stepwise variable selection to validate the findings of the independent test
+
+# Create a df with only the variables needed
+step_aDiv_df = Col_metadata_aDiv %>% 
+  select(diversity, City, Sex, Age, Socioeconomic_level, matches("_med"))
+
+# Fit linear model
+stem_lm = lm(diversity ~ ., data = step_aDiv_df)
+
+# Execute stepwise AIC in both directions
+step_aDiv = MASS::stepAIC(stem_lm, direction = "both")
+
+# Final model
+step_aDiv
+```
+
+# Compositional B-diversity analyses
+## Metacyc pathways
+```{r}
+# Perform principal component analysis
+pwy_distances = Col_pwy_clr %>% 
+    column_to_rownames("Feat_Sample") %>% 
+    dist(method = "euclidean")
+
+pwy_PCoA = cmdscale(pwy_distances, k = 3, eig = T)
+
+
+# Percentage of variance explained by each component
+v_PCos = round(pwy_PCoA$eig/sum(pwy_PCoA$eig), 4)* 100
+
+# Obtain % of variance of each axis
+v_PC1 = v_PCos %>% nth(1)
+v_PC2 = v_PCos %>% nth(2)
+v_PC3 = v_PCos %>% nth(3)
+
+pwy_PCA_axes = pwy_PCoA$points %>% 
+    as.data.frame
+
+# Graph PCo1 and PCo2
+pwy_PCA_plot = pwy_PCA_axes %>% 
+    ggplot(aes(x = V1, y = V2)) +
+    geom_point() + 
+    theme_light() +
+    labs(x = glue("PC1 ({vr}%)", vr = v_PC1), y = glue("PC2 ({vr}%)", vr = v_PC2))
+
+pwy_PCA_plot
+#save_plot(file.path(fig_dir, "pwy_PCA_plot.png"), pwy_PCA_plot, base_width = 8, base_height = 4)
+```
+## PPIs
+I will test both using case-control design and using all the data
+```{r}
+# Case-control
+# Filter distance matrix
+ppi_distances = pwy_distances %>% 
+  as.matrix()
+ppi_distances = ppi_distances[matched_ppi$ID, matched_ppi$ID] %>% 
+  as.dist()
+
+# Test beta dispersion and perform permanova
+ppi_disp_cc = betadisper(ppi_distances, factor(matched_ppi$PPI_med))
+permutest(ppi_disp_cc, pairwise=TRUE)
+adonis(ppi_distances ~ factor(matched_ppi$PPI_med)) 
+
+# Using all samples
+# Test beta dispersion and perform permanova
+ppi_disp_all = betadisper(pwy_distances, factor(Col_metadata_aDiv$PPI_med))
+permutest(ppi_disp_all, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$PPI_med)) 
+```
+
+## Hypertension
+I will test both using case-control design and using all the data
+```{r}
+# Case-control
+# Filter distance matrix
+hypertension_distances = pwy_distances %>% 
+  as.matrix()
+hypertension_distances = hypertension_distances[matched_hyp$ID, matched_hyp$ID] %>% 
+  as.dist()
+
+# Test beta dispersion and perform permanova
+hypertension_disp_cc = betadisper(hypertension_distances, factor(matched_hyp$Hypertension_med))
+permutest(hypertension_disp_cc, pairwise=TRUE)
+adonis(hypertension_distances ~ factor(matched_hyp$Hypertension_med)) 
+
+# Using all samples
+# Test beta dispersion and perform permanova
+hypertension_disp_all = betadisper(pwy_distances, factor(Col_metadata_aDiv$Hypertension_med))
+permutest(hypertension_disp_all, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Hypertension_med)) 
+```
+
+## Diabetes
+I will test both using case-control design and using all the data
+```{r}
+# Case-control
+# Filter distance matrix
+diabetes_distances = pwy_distances %>% 
+  as.matrix()
+diabetes_distances = diabetes_distances[matched_diab$ID, matched_diab$ID] %>% 
+  as.dist()
+
+# Test beta dispersion and perform permanova
+diabetes_disp_cc = betadisper(diabetes_distances, factor(matched_diab$Diabetes_med))
+permutest(diabetes_disp_cc, pairwise=TRUE)
+adonis(diabetes_distances ~ factor(matched_diab$Diabetes_med)) 
+
+# Using all samples
+# Test beta dispersion and perform permanova
+diabetes_disp_all = betadisper(pwy_distances, factor(Col_metadata_aDiv$Diabetes_med))
+permutest(diabetes_disp_all, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Diabetes_med)) 
+```
+
+## Dyslipid
+I will test both using case-control design and using all the data
+```{r}
+# Case-control
+# Filter distance matrix
+dyslip_distances = pwy_distances %>% 
+  as.matrix()
+dyslip_distances = dyslip_distances[matched_dyslip$ID, matched_dyslip$ID] %>% 
+  as.dist()
+
+# Test beta dispersion and perform permanova
+dyslip_disp_cc = betadisper(dyslip_distances, factor(matched_dyslip$Dyslipidemia_med))
+permutest(dyslip_disp_cc, pairwise=TRUE)
+adonis(dyslip_distances ~ factor(matched_dyslip$Dyslipidemia_med)) 
+
+# Using all samples
+# Test beta dispersion and perform permanova
+dyslip_disp_all = betadisper(pwy_distances, factor(Col_metadata_aDiv$Dyslipidemia_med))
+permutest(dyslip_disp_all, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Dyslipidemia_med)) 
+```
+
+## City and socioeconomic status
+```{r}
+# City
+# Test beta dispersion and perform permanova
+city_disp = betadisper(pwy_distances, factor(Col_metadata_aDiv$City))
+permutest(city_disp, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$City)) 
+
+# Socioeconomic status
+# Test beta dispersion and perform permanova
+socioecon_disp = betadisper(pwy_distances, factor(Col_metadata_aDiv$Socioeconomic_level))
+permutest(socioecon_disp, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Socioeconomic_level)) 
+```
+
+## Age and Sex
+```{r}
+# City
+# Test beta dispersion and perform permanova
+# In this case I will use age as categorical variable
+age_disp = betadisper(pwy_distances, factor(Col_metadata_aDiv$Age_range))
+permutest(age_disp, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Age_range)) 
+
+# Socioeconomic status
+# Test beta dispersion and perform permanova
+sex_disp = betadisper(pwy_distances, factor(Col_metadata_aDiv$Sex))
+permutest(sex_disp, pairwise=TRUE)
+adonis(pwy_distances ~ factor(Col_metadata_aDiv$Sex)) 
+```
+
+# Plots
+```{r fig.width=14, fig.height=5}
+# Number of meds
+Meds_upset_plt
+nMeds_plot
+
+# Since this will be the top of a composite figure
+# But upset plot need to be added separately
+# Create an empty space to place upset in post
+empty_plot = (ggplot() + theme_void())
+nMeds_plot_empty = ggarrange(empty_plot, 
+                             nMeds_plot, 
+                             ncol = 2, 
+                             labels = c("A", "B"))
+nMeds_plot_empty
+
+png(file.path(fig_dir, "nMeds_Upset.png"), units = "in", res = 300, height = 5, width = 7); Meds_upset_plt; dev.off()
+save_plot(file.path(fig_dir, "nMeds_aDiv_empty.png"), nMeds_plot_empty, base_height = 5, base_width = 7)
+```
+
+```{r fig.width=14, fig.height=5}
+# Meds aDiv
+Meds_aDiv_plot = ggarrange(matched_ppi_plot, 
+          matched_hyp_plot, 
+          matched_dyslip_plot,  
+          matched_diab_plot,
+          nrow = 1, 
+          align = "hv", 
+          labels = c("C", "D", "E", "F"))
+
+Meds_aDiv_plot
+
+save_plot(file.path(fig_dir, "Meds_aDiv.png"), Meds_aDiv_plot, base_height = 5, base_width = 14)
+
+```
+
+```{r fig.width=14, fig.height=5}
+# City and socioeconomic aDiv
+City_Socioeco_plot = ggarrange(aDiv_Stratum_plt, 
+          aDiv_City_plt, 
+          nrow = 1, 
+          align = "h",  
+          labels = c("G", "H"))
+
+City_Socioeco_plot
+
+save_plot(file.path(fig_dir, "City_Socioeco_aDiv.png"), City_Socioeco_plot, base_height = 5, base_width = 14)
+
+```
+
+```{r fig.width=14, fig.height=5}
+# Age and sex aDiv
+Age_Sex_plot = ggarrange(aDiv_Age_plt, 
+          empty_plot,
+          aDiv_Sex_plt,
+          empty_plot,
+          nrow = 1, 
+          widths = c(2, 0.5, 1, 0.5), 
+          align = "h", 
+           labels = c("I", "", "J", ""))
+
+save_plot(file.path(fig_dir, "Age_Sex_aDiv.png"), Age_Sex_plot, base_height = 5, base_width = 14)
+```
+
+```{r fig.width=14, fig.height=20}
+combined_aDiv_plot = ggarrange(nMeds_plot_empty,
+                               Meds_aDiv_plot,
+                               City_Socioeco_plot,
+                               Age_Sex_plot, 
+                               nrow = 4)
+combined_aDiv_plot
+
+save_plot(file.path(fig_dir, "combined_covar_aDiv_plot.png"), 
+          combined_aDiv_plot, 
+          base_height = 20, base_width = 14)
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
+
+

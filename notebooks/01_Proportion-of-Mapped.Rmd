@@ -1,0 +1,570 @@
+---
+title: "Proportion of mapped reads"
+output: html_notebook
+---
+
+# Goal
+
+Jacobo de la Cuesta-Zuluaga. February 2019.
+
+The aim of this notebook is to assess the proportion of unmapped or unknown reads in the functional profile of the Colombian cohort.
+
+# Init
+
+
+```{r}
+library(tidyverse)
+library(data.table)
+library(cowplot)
+library(glue)
+library(furrr)
+library(corrr)
+library(broom)
+library(LeyLabRMisc)
+library(conflicted)
+```
+
+```{r}
+conflict_prefer("select", "dplyr")
+conflict_prefer("filter", "dplyr")
+conflict_prefer("first", "dplyr")
+```
+
+```{r}
+# Other functions
+
+## Read HUMANn2 Logs
+read_hlog = function(path){
+    
+    # Sample name
+    community_name = path %>%
+        basename %>%
+        str_replace(., ".log", "")
+    
+    # Read file line by line
+    # Keep lines with total and used reads at the species level
+    # create table with data for each sample
+    grep_cmd = glue('grep "Unaligned reads after" {path}', path = path)
+    system(grep_cmd, intern = T) %>% 
+        data.frame(txt = .) %>%
+        separate(txt, into = c("Stamp", "txt", "unmapped"), sep = ": ") %>%
+        select(unmapped) %>%
+        mutate(unmapped = str_replace(unmapped, " %", "")) %>%
+        mutate(unmapped = as.numeric(unmapped),
+               category = c("Nucleotide", "Translated"),
+               sample = rep(community_name, 2))
+}
+
+# In case there are log files that fail the normal function
+other_wise = structure(list(unmapped = c(NA, NA), category = c("Nucleotide", "Translated"), sample = c(NA, NA)), 
+                       class = "data.frame", row.names = c(NA, -2L))
+safe_hlog = safely(read_hlog, otherwise = other_wise)
+```
+
+Load other functions
+```{r}
+# JdlC's util functions
+source("/ebio/abt3_projects/columbian_gut_metagenome/code/misc_r_functions/misc_jdlc.R")
+```
+
+## Multicore processing
+Configure the number of processors to be run with functions of `furrr` package.
+```{r}
+plan(multisession, workers=10) #multicore
+```
+
+
+# Var
+## Directories
+```{r}
+base_dir = "/ebio/abt3_projects/columbian_gut_metagenome"
+log_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/logs/humann2")
+LLMGP_dir = file.path(base_dir, "data/metagenome_profile/2020_04_combined/humann2")
+fig_dir = file.path(base_dir, "code/metagenome_profiles/R_notebooks/Figures")
+metadata_dir = file.path(base_dir, "data/metadata")
+```
+
+## Nonpareil coverage of Cololombian data
+```{r}
+nonpareil_table_file = file.path(base_dir, "data/nonpareil/coverage/2020_04_combined_coverage.tsv") # Latest coverage estimates
+nonpareil_table = read_tsv(nonpareil_table_file) %>% 
+    mutate(Sample = str_replace_all(Sample, "\\-", "\\_"))
+nonpareil_table %>% dfhead()
+```
+
+## Ortholog and Module data
+```{r}
+Col_module_rpk_raw = file.path(LLMGP_dir, "kegg_modules/kegg_modules.tsv") %>% 
+  fread(data.table = F)
+Col_ortho_rpk_raw = file.path(LLMGP_dir, 'unnormalized/unstratified/regroup/genefamilies_uniref50_ko.tsv.gz') %>% 
+  fread(data.table = F)
+```
+
+
+## Metadata
+```{r}
+Col_retain = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    pull(Sample)
+
+Col_metadata_raw = file.path(metadata_dir, "Colombia_curated_metadata.tsv") %>% 
+    fread(., data.table = F)
+
+Col_metadata = Col_metadata_raw %>% 
+    filter(ID %in% Col_retain) %>% 
+    mutate(BMI_status = factor(BMI_status, 
+                               c("Lean", "Overweight", "Obese")),
+           chs_class = factor(chs_class, 
+                              c("Healthy", "Abnormal")), 
+           bsp_class = factor(bsp_class, 
+                              c("Normoweight-Healthy", "Normoweight-Abnormal",
+                                "Overweight-Healthy", "Overweight-Abnormal",
+                                "Obese-Healthy", "Obese-Abnormal")), 
+           Waist_Circumference_status = factor(Waist_Circumference_status, 
+                                               c("Normal", "Central_Obesity")), 
+           Fat_percentage_status = factor(Fat_percentage_status, 
+                                          c("Low", "Normal", "Excess", "Obese")))
+
+# N medications data
+Meds_vars = c("Hypertension_med", "Diabetes_med", "Dislipid_med", "PPI_med")
+Col_metadata = Col_metadata %>% 
+  rowwise() %>% 
+  mutate(across(matches("_med"), function(x) ifelse(x == TRUE, 1, 0)), 
+         n_med = sum(c_across(Meds_vars))) %>% 
+  as.data.frame()
+```
+
+
+# Mappability functional profile analyses
+## Prepare tables
+For alpha-diversity analyses, I will use the nonpareil diversity index, which is based on kmer redundancy and is database-independet.
+```{r}
+# Create alpha-diversity table
+Col_adiv = nonpareil_table %>% 
+    filter(Total.Sequences >= 500000 | C >= 0.6, str_detect(Sample, pattern = "MI")) %>% 
+    select(Feat_sample = Sample, a_diversity = diversity)
+
+Col_adiv %>% dfhead
+
+Col_adiv_metadata = left_join(Col_metadata, Col_adiv, by = c("ID" = "Feat_sample")) %>%
+    left_join(., translated_coverage, by = c("ID" = "Sample")) %>%
+    rename("Mappability_cat" = "category", "Mappability" = "mapped")
+
+Col_adiv_metadata %>% dfhead()
+    
+```
+
+## Association between mappability and host phenotypes
+```{r}
+# Spearman correlation with BMI and MS score
+cor_mapp_bmi = cor.test(Col_adiv_metadata$Mappability, Col_adiv_metadata$BMI, method = "s") %>% 
+    tidy
+
+cor_mapp_ms = cor.test(Col_adiv_metadata$Mappability, Col_adiv_metadata$MS_score, method = "s") %>%
+    tidy
+
+bind_rows(cor_mapp_bmi, cor_mapp_ms) %>%
+    mutate(var = c("BMI", "MS_score"))
+
+# Kruskal tests with BMI, CHS and BSP classes
+kw_mapp_bmi = kruskal.test(Col_adiv_metadata$Mappability, Col_adiv_metadata$BMI_status) %>% 
+    tidy
+
+kw_mapp_chs = kruskal.test(Col_adiv_metadata$Mappability, Col_adiv_metadata$chs_class) %>% 
+    tidy
+
+kw_mapp_bsp = kruskal.test(Col_adiv_metadata$Mappability, Col_adiv_metadata$bsp_class) %>% 
+    tidy
+
+bind_rows(kw_mapp_bmi, kw_mapp_chs, kw_mapp_bsp) %>%
+    mutate(var = c("BMI_status", "chs_class", "bsp_class"))
+```
+
+
+# K-mer based alpha-diversity analyses
+```{r}
+adiv_hist = Col_adiv %>% 
+    ggplot(aes(x = a_diversity)) + 
+    geom_histogram(bins = nclass.FD(Col_adiv$a_diversity)) +
+    theme_light() 
+
+adiv_hist
+save_plot(file.path(fig_dir, "adiv_hist.png"), adiv_hist)
+```
+
+```{r}
+Col_adiv %>% 
+    summarise(median = median(a_diversity), iqr = IQR(a_diversity))
+```
+
+## Association with host health
+```{r}
+# Linear models on the residuals of metagenome sequence richness
+# Extract residuals
+adiv_residuals = lm(a_diversity ~ Hypertension_med + Diabetes_med + Dislipid_med + PPI_med + Sex + Age, data = Col_adiv_metadata) %>%
+  pluck(residuals)
+
+# adiv_residuals = lm(a_diversity ~ City + Sex + Age, data = Col_adiv_metadata) %>% 
+#   pluck(residuals) 
+
+# df with variables to test
+adiv_vars = Col_adiv_metadata %>% 
+  select(BMI, 
+         chs_class, 
+         Waist_Circumference, 
+         Fat_percentage)
+
+# Run linear model on each variable
+adiv_results = map(adiv_vars, 
+    function(x) lm(adiv_residuals ~ x))
+
+adiv_pvals = map_df(adiv_vars, 
+       function(x) tidy(lm(adiv_residuals ~ x))) %>% 
+  filter(term != "(Intercept)") %>% 
+  mutate(term = colnames(adiv_vars), 
+         p_adj = p.adjust(p.value, method = "BH"))
+  
+
+# Print results to tidy table
+# Adjust P value using BH method
+adiv_performance = map_df(adiv_results, function(x) glance(x)) %>% 
+  mutate(variable = colnames(adiv_vars), p_adj = p.adjust(p.value, method = "BH")) %>% 
+  arrange(AIC) %>% 
+  select(variable, AIC, adj.r.squared, p.value, p_adj) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+adiv_pvals
+adiv_performance
+```
+
+
+```{r}
+# Models including CHS
+# df with variables to test
+adiv_vars_control = Col_adiv_metadata %>% 
+  select(BMI, 
+         Waist_Circumference, 
+         Fat_percentage)
+
+# Run linear model on each variable
+adiv_results_control = map(adiv_vars_control, 
+    function(x) lm(adiv_residuals ~ x + adiv_vars$chs_class))
+
+# Adjust P value using BH method
+adiv_control_pvals = map_df(adiv_vars_control, 
+       function(x) tidy(lm(adiv_residuals ~ x + adiv_vars$chs_class))) %>% 
+  filter(term != "(Intercept)") %>% 
+  mutate(term = c("BMI", "BMI-CHS", "Waist_Circumference", "Waist_Circumference-CHS", "Fat_percentage", "Fat_percentage-CHS"), 
+         p_adj = p.adjust(p.value, method = "BH"))
+
+# Print results to tidy table
+adiv_control_performance = map_df(adiv_results_control, function(x) glance(x)) %>% 
+  mutate(variable = colnames(adiv_vars_control)) %>% 
+  arrange(AIC) %>% 
+  select(variable, AIC, adj.r.squared) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+adiv_control_pvals
+adiv_control_performance
+```
+
+```{r}
+# Using OB as categorical variable
+# Models not including CHS
+# df with variables to test
+adiv_vars_cat = Col_adiv_metadata %>% 
+  select(BMI_status, 
+         chs_class,
+         Waist_Circumference_status, 
+         Fat_percentage_status)
+
+# Run linear model on each variable
+adiv_results_cat = map(adiv_vars_cat, 
+    function(x) lm(adiv_residuals ~ x))
+
+# Print results to tidy table
+adiv_performance_cat = map_df(adiv_results_cat, function(x) glance(x)) %>% 
+  mutate(variable = colnames(adiv_vars_cat)) %>% 
+  arrange(AIC) %>% 
+  select(variable, AIC, adj.r.squared) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+
+
+# Using OB as categorical variable
+# Models including CHS
+# df with variables to test
+adiv_vars_control_cat = Col_adiv_metadata %>% 
+  select(BMI_status, 
+         Waist_Circumference_status, 
+         Fat_percentage_status)
+
+# Run linear model on each variable
+adiv_results_control_cat = map(adiv_vars_control_cat, 
+    function(x) lm(adiv_residuals ~ x + adiv_vars$chs_class))
+
+# Print results to tidy table
+adiv_control_performance_cat = map_df(adiv_results_control_cat, function(x) glance(x)) %>% 
+  mutate(variable = colnames(adiv_vars_control_cat)) %>% 
+  arrange(AIC) %>% 
+  select(variable, AIC, adj.r.squared) %>% 
+  mutate_if(is.numeric, function(x) round(x, 3))
+
+adiv_performance_cat
+adiv_control_performance_cat
+```
+
+
+```{r}
+
+lm(adiv_residuals ~ BMI , data = adiv_vars) %>% 
+  tidy()
+
+lm(adiv_residuals ~ BMI + chs_class, data = adiv_vars) %>% 
+  summary()
+```
+
+
+```{r}
+map_df(adiv_results, function(x) tidy(x)) %>% 
+  filter(term != "(Intercept)")
+```
+
+
+```{r fig.width=11, fig.height=5}
+a_bmi_scatter = Col_adiv_metadata %>% 
+    ggplot(aes(x = BMI, y = a_diversity)) +
+    geom_point(aes(color = Col_adiv_metadata$BMI_status)) +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    #scale_color_manual(values = c("#000004FF", "#B63679FF", "#FCFDBFFF")) +
+    #scale_color_viridis_d(option = 'B', begin = 0.0, end = 0.65) +
+    scale_color_manual(values = c('#80cdc1', '#dfc27d', '#8c510a')) + 
+    #scale_color_grey(start=0.9, end=0.2) + 
+    #geom_vline(xintercept = c(18.5, 25, 30), linetype="dashed") +
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "BMI", y = "Sequence diversity", color = "BMI category")
+
+a_bmi_chs_scatter = Col_adiv_metadata %>% 
+    mutate(chs_class = ifelse(chs_class == "Abnormal", 'Unhealthy', 'Healthy')) %>% 
+    ggplot(aes(x = BMI, y = a_diversity, color=chs_class, shape=chs_class)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F) +
+    #scale_color_grey(start=0.5, end=0.2) + 
+    scale_color_viridis_d(begin = 0.8, end = 0.2) +
+    # geom_vline(xintercept = c(18.5, 25, 30), linetype="dashed") +
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "BMI", y = "Sequence diversity", color = "CHS", shape = "CHS") 
+
+# Print together and save files
+a_bmi_scatterplots = plot_grid(a_bmi_scatter, a_bmi_chs_scatter, align = "h")
+a_bmi_scatterplots
+save_plot(file.path(fig_dir, "a_bmi_scatterplots.png"), a_bmi_scatterplots, base_width = 11, base_height = 5)
+```
+
+```{r fig.width=11, fig.height=5}
+a_wc_scatter = Col_adiv_metadata %>% 
+    mutate(Waist_Circumference_status = str_replace(Waist_Circumference_status, "_", " "), 
+           Waist_Circumference_status = str_replace(Waist_Circumference_status, "Normal", "Lean"),
+           Waist_Circumference_status = str_replace(Waist_Circumference_status, "Obesity", "obesity")) %>% 
+    ggplot(aes(x = Waist_Circumference, y = a_diversity)) +
+    geom_point(aes(color = Waist_Circumference_status)) +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    #scale_color_viridis_d(option = 'B', begin = 0.65, end = 0.0) +
+    scale_color_manual(values = c('#dfc27d', '#80cdc1')) +
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "WC", y = "Sequence diversity", color = "WC category")
+
+a_wc_chs_scatter = Col_adiv_metadata %>% 
+    mutate(chs_class = ifelse(chs_class == "Abnormal", 'Unhealthy', 'Healthy')) %>% 
+    ggplot(aes(x = Waist_Circumference, y = a_diversity, color=chs_class, shape=chs_class)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F) +
+    scale_color_viridis_d(begin = 0.8, end = 0.2) +
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "WC", y = "Sequence diversity", color = "CHS", shape = "CHS") 
+
+# Print together and save files
+a_wc_scatterplots = plot_grid(a_wc_scatter, a_wc_chs_scatter, align = "h")
+a_wc_scatterplots
+save_plot(file.path(fig_dir, "a_wc_scatterplots.png"), a_wc_scatterplots, base_width = 11, base_height = 5)
+```
+
+```{r fig.width=11, fig.height=5}
+a_bf_scatter = Col_adiv_metadata %>% 
+    mutate(Fat_percentage = Fat_percentage*100, 
+           Fat_percentage_status = str_replace(Fat_percentage_status, "Normal", "Lean"), 
+           Fat_percentage_status = factor(Fat_percentage_status, levels = c("Low", "Lean", "Excess", "Obese"))) %>% 
+    ggplot(aes(x = Fat_percentage, y = a_diversity)) +
+    geom_point(aes(color = Fat_percentage_status)) +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    #scale_color_viridis_d(option = 'B', begin = 0.9, end = 0.0) +
+    scale_color_manual(values = c('#003c30', '#80cdc1', '#dfc27d', '#8c510a')) + 
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "Body fat (%)", y = "Sequence diversity", color = "BF% category")
+
+a_bf_chs_scatter = Col_adiv_metadata %>% 
+    mutate(Fat_percentage = Fat_percentage*100) %>% 
+    ggplot(aes(x = Fat_percentage, y = a_diversity, color=chs_class, shape=chs_class)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F) +
+    scale_color_viridis_d(begin = 0.8, end = 0.2) +
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(0.99,0.01)) +
+    labs(x = "Body fat (%)", y = "Sequence diversity", color = "CHS", shape = "CHS") 
+
+# Print together and save files
+a_bf_scatterplots = plot_grid(a_bf_scatter, a_bf_chs_scatter, align = "h")
+a_bf_scatterplots
+save_plot(file.path(fig_dir, "a_bf_scatterplots.png"), a_bf_scatterplots, base_width = 11, base_height = 5)
+```
+
+
+```{r fig.width=12, fig.height=4}
+# Combined Diversity and obesity metrics
+
+combined_alpha_plot = ggpubr::ggarrange(plotlist = list(a_bmi_chs_scatter, a_wc_chs_scatter, a_bf_chs_scatter), 
+                  nrow = 1, common.legend = TRUE, legend = "right")
+
+combined_alpha_plot
+
+save_plot(file.path(fig_dir, "Combined_alpha_obesity.svg"), combined_alpha_plot, base_width = 12, base_height = 4)
+```
+
+
+```{r fig.width=9, fig.height=3}
+a_bmi_boxplot = ggplot(Col_adiv_metadata, aes(x = BMI_status, y = a_diversity)) + 
+    geom_boxplot(notch = T) +
+    theme_light() +
+    theme(axis.text.x=element_text(angle=45, hjust=1)) + 
+    labs(x = "CHS", y = "Sequence diversity")
+
+a_chs_boxplot = ggplot(Col_adiv_metadata, aes(x = chs_class, y = a_diversity)) + 
+    geom_boxplot(notch = T) +
+    theme_light() +
+    theme(axis.text.x=element_text(angle=45, hjust=1)) + 
+    labs(x = "CHS", y = "Sequence diversity") 
+
+a_bsp_boxplot = ggplot(Col_adiv_metadata, aes(x = bsp_class, y = a_diversity)) + 
+    geom_boxplot(notch = T) +
+    theme_light() +
+    theme(axis.text.x=element_text(angle=45, hjust=1)) + 
+    labs(x = "CHS", y = "Sequence diversity")
+
+a_boxplots = plot_grid(a_bmi_boxplot, a_chs_boxplot, a_bsp_boxplot, nrow = 1, align = "h")
+a_boxplots
+save_plot(file.path(fig_dir, "a_boxplots.png"), a_boxplots, base_width = 7, base_height = 3)
+```
+
+
+
+```{r}
+# Other plots
+a_wc_scatter = Col_adiv_metadata %>% 
+    ggplot(aes(x = Waist_Circumference, y = a_diversity, color=chs_class, shape=chs_class)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F) +
+    scale_color_grey(start=0.5, end=0.2) + 
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(1,0)) +
+    labs(x = "Waist Circumference", y = "Sequence diversity") 
+
+a_bf_scatter = Col_adiv_metadata %>% 
+    ggplot(aes(x = Fat_percentage, y = a_diversity, color=chs_class, shape=chs_class)) +
+    geom_point() +
+    geom_smooth(method='lm', se=F) +
+    scale_color_grey(start=0.5, end=0.2) + 
+    theme_light() +
+    theme(legend.justification=c(1,0), legend.position=c(1,0)) +
+    labs(x = "Fat percentage", y = "Sequence diversity")
+```
+
+# Module and Ortholog Richness
+## Prepare tables
+```{r}
+# Modules table
+Col_module_rpk = Col_module_rpk_raw %>% 
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+
+# Orthologs table
+ Col_ortho_rpk = Col_ortho_rpk_raw %>%
+  rename("Feature" = "# Gene Family") %>% 
+  prep_table() %>% 
+  select(Feature, starts_with("MI")) %>% 
+  transpose_df() %>% 
+  filter(Sample %in% Col_retain) 
+```
+
+
+```{r}
+# Calculate richness of modules and orthologs based on presence/absence
+
+# Module richness
+module_richness = Col_module_rpk %>% 
+  column_to_rownames("Sample") %>% 
+  vegan::decostand(method = "pa") %>% 
+  rowSums() %>% 
+  data.frame(mod_rich = .) %>% 
+  rownames_to_column("Sample")
+
+# Ortholog richness
+ortho_richness = Col_ortho_rpk %>% 
+  column_to_rownames("Sample") %>% 
+  vegan::decostand(method = "pa") %>% 
+  rowSums() %>% 
+  data.frame(ortho_rich = .) %>% 
+  rownames_to_column("Sample")
+
+# Create single table adding sequence diversity
+full_richness = full_join(module_richness, ortho_richness) %>% 
+  left_join(nonpareil_table) %>% 
+  select("Sample",diversity, mod_rich, ortho_rich, C) %>% 
+  group_by(Sample) %>% 
+  slice(1) %>% 
+  ungroup()
+
+full_richness %>% head
+```
+
+Plots
+```{r fig.width=12, fig.height=4}
+# Scatter plot of module richness by sequence diversity
+mod_div_scatter = full_richness %>% 
+  ggplot(aes(x = diversity, y = mod_rich)) +
+    geom_point() +
+    theme_light() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    labs(x = "Sequence diversity", y = "Module richness")
+
+# Scatter plot of ortholog richness by sequence diversity
+ortho_div_scatter = full_richness %>% 
+  ggplot(aes(x = diversity, y = ortho_rich)) +
+    geom_point() +
+    theme_light() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    labs(x = "Sequence diversity", y = "Ortholog richness")
+
+# Scatter plot of module richness by ortholog richness
+mod_ortho_scatter = full_richness %>% 
+  ggplot(aes(x = mod_rich, y = ortho_rich)) +
+    geom_point() +
+    theme_light() +
+    geom_smooth(method='lm', se=F, color="grey50") +
+    labs(x = "Module richness", y = "Ortholog richness")
+
+plot_grid(mod_ortho_scatter, mod_div_scatter, ortho_div_scatter,
+          nrow = 1, align = "h")
+```
+
+# Session Info
+```{r}
+sessionInfo()
+```
